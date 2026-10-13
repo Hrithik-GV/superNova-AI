@@ -1,0 +1,65 @@
+{
+  "name": "code-mentor",
+  "displayName": "Code Mentor",
+  "description": "An AI coding mentor for beginners that teaches instead of just generating code.",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Programming Languages",
+    "Education"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "mentor",
+          "title": "Code Mentor",
+          "icon": "resources/mentor-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "mentor": [
+        {
+          "type": "webview",
+          "id": "mentor.chat",
+          "name": "Mentor Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "mentor.openChat",
+        "title": "Code Mentor: Open Chat"
+      }
+    ],
+    "configuration": {
+      "title": "Code Mentor",
+      "properties": {
+        "mentor.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Anthropic API key for Code Mentor (Anthropic Claude Haiku 5.5)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0"
+  }
+}
