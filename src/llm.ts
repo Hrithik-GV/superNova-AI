@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { SYSTEM_PROMPT } from './prompt';
+import { buildSystemPrompt } from './prompt';
+import { MentorConfig } from './config';
 
 /**
  * Message in conversation history passed to the LLM.
@@ -39,9 +40,9 @@ export interface MentorReply {
   code_snippet: string | null; // max 5 lines unless hint_level is 4
   line_notes?: LineNote[];    // optional line-by-line notes for explain mode
   findings?: ReviewFinding[]; // optional findings for review mode
-  understanding?: 'solid' | 'partial' | 'shaky'; // optional rating for explain_back mode
-  got_right?: string[];       // what learner got right in explain_back
-  gaps?: string[];            // topics/concepts to revisit in explain_back
+  understanding?: 'solid' | 'partial' | 'shaky'; // optional rating for explain_back/paste_check modes
+  got_right?: string[];       // what learner got right in explain_back/paste_check
+  gaps?: string[];            // topics/concepts to revisit in explain_back/paste_check
 }
 
 /**
@@ -205,13 +206,13 @@ export function parseMentorReply(raw: string): MentorReply {
       }
     }
 
-    // 3i. Understanding rating (optional "solid" | "partial" | "shaky" for explain_back mode)
+    // 3i. Understanding rating (optional "solid" | "partial" | "shaky" for explain_back/paste_check modes)
     let understanding: 'solid' | 'partial' | 'shaky' | undefined = undefined;
     if (parsed.understanding === 'solid' || parsed.understanding === 'partial' || parsed.understanding === 'shaky') {
       understanding = parsed.understanding;
     }
 
-    // 3j. Got right list (optional string array for explain_back mode)
+    // 3j. Got right list (optional string array for explain_back/paste_check modes)
     let got_right: string[] | undefined = undefined;
     if (Array.isArray(parsed.got_right)) {
       const items = parsed.got_right
@@ -222,7 +223,7 @@ export function parseMentorReply(raw: string): MentorReply {
       }
     }
 
-    // 3k. Gaps to revisit list (optional string array for explain_back mode)
+    // 3k. Gaps to revisit list (optional string array for explain_back/paste_check modes)
     let gaps: string[] | undefined = undefined;
     if (Array.isArray(parsed.gaps)) {
       const items = parsed.gaps
@@ -254,17 +255,25 @@ export function parseMentorReply(raw: string): MentorReply {
 
 /**
  * Sends conversation history to Google Gemini asking explicitly for JSON output.
- * Reads API key dynamically from settings and returns the raw response text.
+ * Reads API key dynamically from settings and dynamically builds the system prompt
+ * from the active instructor config (.mentor.json).
  */
-export async function askMentor(history: ChatMessage[]): Promise<string> {
+export async function askMentor(
+  history: ChatMessage[],
+  config?: MentorConfig,
+  activeConfig?: boolean
+): Promise<string> {
   // Read API key and model from VS Code configuration
-  const config = vscode.workspace.getConfiguration('mentor');
-  const apiKey = (config.get<string>('apiKey', '') || config.get<string>('apikey', '')).trim();
-  const modelName = config.get<string>('model', 'gemini-3.5-flash').trim() || 'gemini-3.5-flash';
+  const vsConfig = vscode.workspace.getConfiguration('mentor');
+  const apiKey = (vsConfig.get<string>('apiKey', '') || vsConfig.get<string>('apikey', '')).trim();
+  const modelName = vsConfig.get<string>('model', 'gemini-3.5-flash').trim() || 'gemini-3.5-flash';
 
   if (!apiKey) {
     throw new MissingApiKeyError('No Gemini API key found. Please configure "mentor.apiKey" in your settings.');
   }
+
+  // Build system prompt based on active instructor configuration
+  const systemInstruction = buildSystemPrompt(config, activeConfig);
 
   // Initialize Google Generative AI client with user's API key
   const genAI = new GoogleGenerativeAI(apiKey);
@@ -272,7 +281,7 @@ export async function askMentor(history: ChatMessage[]): Promise<string> {
   // Configure model with system instruction and JSON output mode
   const model = genAI.getGenerativeModel({
     model: modelName,
-    systemInstruction: SYSTEM_PROMPT,
+    systemInstruction,
     generationConfig: {
       responseMimeType: 'application/json'
     }

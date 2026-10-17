@@ -14,18 +14,37 @@ import {
   saveConcepts,
   getConcepts
 } from './progress';
+import {
+  MentorConfig,
+  DEFAULT_CONFIG,
+  loadConfig,
+  watchConfigFile,
+  createOrOpenConfigFile
+} from './config';
+import {
+  registerPasteDetector,
+  PasteEventPayload
+} from './paste';
 
 /**
  * Activates the Code Mentor extension.
- * Sets up the WebviewViewProvider for the sidebar chat, initializes concept progress tracking,
- * and registers extension commands.
+ * Sets up the WebviewViewProvider for the sidebar chat, loads instructor config,
+ * registers paste detection, and registers commands.
  */
-export function activate(context: vscode.ExtensionContext) {
-  // Initialize progress tracking module with extension globalState
+export async function activate(context: vscode.ExtensionContext) {
+  // 1. Initialize concept progress tracking module with extension globalState
   initProgress(context.globalState);
 
-  // 1. Create and register the WebviewViewProvider for the sidebar chat
-  const provider = new MentorChatViewProvider(context.extensionUri, context.globalState);
+  // 2. Load instructor config (.mentor.json) from workspace root
+  const initialConfig = await loadConfig();
+
+  // 3. Create and register the WebviewViewProvider for the sidebar chat
+  const provider = new MentorChatViewProvider(
+    context.extensionUri,
+    context.globalState,
+    initialConfig.config,
+    initialConfig.active
+  );
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
@@ -33,21 +52,34 @@ export function activate(context: vscode.ExtensionContext) {
       provider,
       {
         webviewOptions: {
-          // Retain state when the webview is hidden (e.g. user switches sidebar tabs)
           retainContextWhenHidden: true
         }
       }
     )
   );
 
-  // 2. Register command to open / focus the Code Mentor sidebar
+  // 4. Watch for .mentor.json creation, changes, and deletion
+  const configWatcher = watchConfigFile((config, active) => {
+    provider.updateConfig(config, active);
+  });
+  context.subscriptions.push(configWatcher);
+
+  // 5. Register paste detector (authenticates pastes against clipboard, non-modal, non-blocking)
+  registerPasteDetector(
+    context,
+    () => provider.getConfigState(),
+    async (payload) => {
+      await provider.handlePasteEvent(payload);
+    }
+  );
+
+  // 6. Register extension commands
   context.subscriptions.push(
     vscode.commands.registerCommand('mentor.openChat', async () => {
       await vscode.commands.executeCommand('mentor.chat.focus');
     })
   );
 
-  // 3. Register right-click / palette command: "Mentor: Explain Selection"
   context.subscriptions.push(
     vscode.commands.registerCommand('mentor.explainSelection', async () => {
       const editor = vscode.window.activeTextEditor;
@@ -72,21 +104,22 @@ export function activate(context: vscode.ExtensionContext) {
       const fileName = path.basename(doc.fileName);
       const languageId = doc.languageId || 'plaintext';
 
-      // Focus the sidebar webview
       await vscode.commands.executeCommand('mentor.chat.focus');
-
-      // Request explanation through the provider
       await provider.explainSelection(fileName, languageId, selectedText);
     })
   );
 
-  // 4. Register command palette command: "Mentor: Review My Code" (command palette only)
   context.subscriptions.push(
     vscode.commands.registerCommand('mentor.reviewFile', async () => {
-      // Capture the active editor before focusing the webview so focus change doesn't clear it
       const editor = vscode.window.activeTextEditor;
       await vscode.commands.executeCommand('mentor.chat.focus');
       await provider.reviewActiveFile(editor);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mentor.createConfig', async () => {
+      await createOrOpenConfigFile();
     })
   );
 }
@@ -103,25 +136,59 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
 
   // In-memory conversation history.
-  // Stores learner's plain text and the model's raw JSON replies so LLM retains full context.
   private _history: ChatMessage[] = [];
 
   // Per-task state retained on the extension host
   private _currentLevel: 1 | 2 | 3 | 4 = 1;
   private _currentTaskText: string = '';
-  // Tracks active interaction mode: 'task' (normal ladder), 'explain', 'review', or 'explain_back'
-  private _currentMode: 'task' | 'explain' | 'review' | 'explain_back' = 'task';
+  // Tracks active interaction mode: 'task', 'explain', 'review', 'explain_back', 'paste_check'
+  private _currentMode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' = 'task';
+
+  // Active instructor configuration state
+  private _currentConfig: MentorConfig;
+  private _activeConfig: boolean;
 
   // Webview lifecycle readiness and queued pending requests for when sidebar is closed
   private _isWebviewReady: boolean = false;
   private _pendingExplain: { fileName: string; languageId: string; code: string } | null = null;
   private _pendingReview: { fileName: string; languageId: string; code: string } | null = null;
+  private _pendingPasteExplain: PasteEventPayload | null = null;
   private _pendingNotice: string | null = null;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
-    private readonly _globalState: vscode.Memento
-  ) {}
+    private readonly _globalState: vscode.Memento,
+    initialConfig: MentorConfig,
+    initialActive: boolean
+  ) {
+    this._currentConfig = initialConfig;
+    this._activeConfig = initialActive;
+  }
+
+  /**
+   * Updates configuration dynamically when .mentor.json is modified or deleted.
+   */
+  public updateConfig(config: MentorConfig, active: boolean): void {
+    this._currentConfig = config;
+    this._activeConfig = active;
+
+    // Send updated config state to webview
+    this._postMessageToWebview({
+      type: 'config',
+      config: this._currentConfig,
+      active: this._activeConfig
+    });
+  }
+
+  /**
+   * Returns current config state for paste detector.
+   */
+  public getConfigState(): { config: MentorConfig; active: boolean } {
+    return {
+      config: this._currentConfig,
+      active: this._activeConfig
+    };
+  }
 
   public resolveWebviewView(
     webviewView: vscode.WebviewView,
@@ -131,13 +198,11 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     this._view = webviewView;
     this._isWebviewReady = false;
 
-    // Enable JavaScript in the webview
     webviewView.webview.options = {
       enableScripts: true,
       localResourceRoots: [this._extensionUri]
     };
 
-    // Render the initial HTML
     webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
     // =========================================================================
@@ -146,8 +211,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage(async (message) => {
       switch (message.type) {
         case 'ready': {
-          // Webview has loaded and its message listener is registered
           this._isWebviewReady = true;
+
+          // Deliver initial config and active status to webview
+          this._postMessageToWebview({
+            type: 'config',
+            config: this._currentConfig,
+            active: this._activeConfig
+          });
 
           // Dispatch any actions queued while sidebar was closed
           if (this._pendingNotice) {
@@ -165,37 +236,47 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             const pending = this._pendingReview;
             this._pendingReview = null;
             await this._executeReview(pending.fileName, pending.languageId, pending.code);
+          } else if (this._pendingPasteExplain) {
+            const pending = this._pendingPasteExplain;
+            this._pendingPasteExplain = null;
+            await this._promptPasteCheckInWebview(pending);
           }
           break;
         }
 
         case 'ask': {
-          // User submitted a question from the webview chat input
           await this._handleUserAsk(message.text, message.hintLevel);
           break;
         }
 
         case 'needMoreHelp': {
-          // Learner clicked "Need more help?" to move up one level on the current task
           await this._handleNeedMoreHelp(message.hintLevel);
           break;
         }
 
         case 'reviewFile': {
-          // Learner clicked "Review my code" in sidebar header
           await this.reviewActiveFile();
           break;
         }
 
         case 'explainBack': {
-          // Learner submitted their own understanding check
           await this._handleExplainBack(message.explanation);
+          break;
+        }
+
+        case 'submitPasteCheck': {
+          // Learner submitted explanation for pasted code
+          await this._handlePasteCheck(
+            message.fileName,
+            message.languageId,
+            message.code,
+            message.explanation
+          );
           break;
         }
 
         case 'newTask':
         case 'clearHistory': {
-          // Clears conversation history, resets level to 1, and clears chat UI
           this._history = [];
           this._currentLevel = 1;
           this._currentTaskText = '';
@@ -207,7 +288,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         case 'openSettings': {
-          // User clicked the "Configure Gemini API Key" button
           await vscode.commands.executeCommand(
             'workbench.action.openSettings',
             'mentor.apiKey'
@@ -219,18 +299,87 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Handles paste event triggered by paste detector:
+   * - "explain_to_me": Uses Explain Selection pipeline with pasted text
+   * - "explain_it": Prompts learner with inline panel in chat
+   */
+  public async handlePasteEvent(payload: PasteEventPayload): Promise<void> {
+    await vscode.commands.executeCommand('mentor.chat.focus');
+
+    if (payload.action === 'explain_to_me') {
+      // Reuse Explain Selection pipeline
+      this._postMessageToWebview({
+        type: 'userMessage',
+        text: 'Explaining the pasted code...'
+      });
+
+      const prompt = `Mode: explain\nFile: ${payload.fileName} (${payload.languageId})\nSelected code:\n${payload.pastedCode}`;
+      await this._executePrompt(prompt, 'explain');
+    } else if (payload.action === 'explain_it') {
+      if (!this._view || !this._isWebviewReady) {
+        this._pendingPasteExplain = payload;
+        return;
+      }
+      await this._promptPasteCheckInWebview(payload);
+    }
+  }
+
+  /**
+   * Prompts the learner in webview to explain the pasted code in their own words.
+   * Pasted code remains in memory only.
+   */
+  private async _promptPasteCheckInWebview(payload: PasteEventPayload): Promise<void> {
+    // Truncate code display at 120 lines for readability
+    const lines = payload.pastedCode.split(/\r?\n/);
+    let displayCode = payload.pastedCode;
+    let isTruncated = false;
+    if (lines.length > 120) {
+      displayCode = lines.slice(0, 120).join('\n') + '\n\n// ... (pasted code truncated to 120 lines)';
+      isTruncated = true;
+    }
+
+    this._postMessageToWebview({
+      type: 'pasteCheckPrompt',
+      fileName: payload.fileName,
+      languageId: payload.languageId,
+      code: payload.pastedCode,
+      displayCode: displayCode,
+      isTruncated: isTruncated,
+      lineCount: lines.length
+    });
+  }
+
+  /**
+   * Handles submission of learner's explanation of pasted code.
+   */
+  private async _handlePasteCheck(
+    fileName: string,
+    languageId: string,
+    code: string,
+    explanation: string
+  ): Promise<void> {
+    this._currentMode = 'paste_check';
+
+    // Show learner-side message
+    this._postMessageToWebview({
+      type: 'userMessage',
+      text: 'Checking my understanding of the pasted code...'
+    });
+
+    const prompt = `Mode: paste_check\nFile: ${fileName} (${languageId})\nPasted code:\n${code}\nLearner's explanation:\n${explanation}`;
+    await this._executePrompt(prompt, 'paste_check');
+  }
+
+  /**
    * Entry point for the "Mentor: Explain Selection" command.
-   * Queues the request if webview isn't loaded yet; otherwise executes immediately.
    */
   public async explainSelection(fileName: string, languageId: string, selectedText: string): Promise<void> {
-    // Truncate selections over ~150 lines
     const lines = selectedText.split(/\r?\n/);
     let code = selectedText;
     if (lines.length > 150) {
       code = lines.slice(0, 150).join('\n') + '\n\n// ... (selection truncated to 150 lines)';
     }
 
-    // If webview is not ready yet, queue the request until the 'ready' signal arrives
     if (!this._view || !this._isWebviewReady) {
       this._pendingExplain = { fileName, languageId, code };
       return;
@@ -239,32 +388,19 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     await this._executeExplain(fileName, languageId, code);
   }
 
-  /**
-   * Executes an explain request once the webview is ready.
-   */
   private async _executeExplain(fileName: string, languageId: string, code: string): Promise<void> {
     this._currentMode = 'explain';
 
-    // Show a short learner message in the chat so the conversation reads naturally
     this._postMessageToWebview({
       type: 'userMessage',
       text: 'Explaining your selection...'
     });
 
-    // Build the user message for explain mode
     const prompt = `Mode: explain\nFile: ${fileName} (${languageId})\nSelected code:\n${code}`;
-
     await this._executePrompt(prompt, 'explain');
   }
 
-  /**
-   * Entry point for Review My Code:
-   * Gathers active file name, languageId, and content (truncated at ~300 lines).
-   * If there is no active editor or file is empty, shows friendly in-chat notice without calling LLM.
-   * Reuses the 'ready' handshake and queue when sidebar was closed.
-   */
   public async reviewActiveFile(editor?: vscode.TextEditor): Promise<void> {
-    // Check passed editor, activeTextEditor, or first visible editor (handles webview focus)
     const targetEditor = editor || vscode.window.activeTextEditor || vscode.window.visibleTextEditors[0];
     if (!targetEditor || !targetEditor.document) {
       this._handleNoActiveFileForReview();
@@ -281,7 +417,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     const fileName = path.basename(doc.fileName);
     const languageId = doc.languageId || 'plaintext';
 
-    // Truncate file at ~300 lines
     const totalLines = doc.lineCount;
     let code = doc.getText();
     if (totalLines > 300) {
@@ -290,7 +425,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       code = doc.getText(new vscode.Range(0, 0, endLine, endChar)) + '\n\n// ... (file truncated to 300 lines)';
     }
 
-    // If webview is not ready yet, queue the review request
     if (!this._view || !this._isWebviewReady) {
       this._pendingReview = { fileName, languageId, code };
       return;
@@ -299,10 +433,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     await this._executeReview(fileName, languageId, code);
   }
 
-  /**
-   * Shows a friendly in-chat message when review is triggered without an active/non-empty file.
-   * Does NOT call the LLM.
-   */
   private _handleNoActiveFileForReview(): void {
     const notice = 'Open a file with some code first';
     if (!this._view || !this._isWebviewReady) {
@@ -315,30 +445,19 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /**
-   * Executes a review request once the webview is ready.
-   */
   private async _executeReview(fileName: string, languageId: string, code: string): Promise<void> {
     this._currentMode = 'review';
     this._currentTaskText = `Review ${fileName}`;
 
-    // Show a short learner-side line in the chat: "Reviewing <file name>..."
     this._postMessageToWebview({
       type: 'userMessage',
       text: `Reviewing ${fileName}...`
     });
 
-    // Build the user message for review mode
     const prompt = `Mode: review\nFile: ${fileName} (${languageId})\nCurrent file:\n${code}`;
-
     await this._executePrompt(prompt, 'review');
   }
 
-  /**
-   * Handles "Explain it back" submission from the learner.
-   * Gathers original task text and active file content (truncated to ~300 lines).
-   * If there is no active file, sends prompt without the file section.
-   */
   private async _handleExplainBack(learnerExplanation: string): Promise<void> {
     const trimmedExplanation = (learnerExplanation || '').trim();
     if (!trimmedExplanation) {
@@ -348,7 +467,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     this._currentMode = 'explain_back';
     const task = this._currentTaskText || 'Current coding task';
 
-    // Gather active file content if present
     const targetEditor = vscode.window.activeTextEditor || vscode.window.visibleTextEditors[0];
     let fileSection = '';
     if (targetEditor && targetEditor.document) {
@@ -366,14 +484,13 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    // Build user message for explain_back mode
     const prompt = `Mode: explain_back\nTask: ${task}${fileSection}\nLearner's explanation:\n${trimmedExplanation}`;
-
     await this._executePrompt(prompt, 'explain_back');
   }
 
   /**
    * Processes a learner question from the chat input.
+   * Clamps requested hint level to config.maxHintLevel on the extension host.
    */
   private async _handleUserAsk(userText: string, hintLevel?: number) {
     const trimmedText = userText ? userText.trim() : '';
@@ -381,28 +498,39 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // Track current task text and hint level per task
     this._currentTaskText = trimmedText;
-    const level = (hintLevel === 1 || hintLevel === 2 || hintLevel === 3 || hintLevel === 4)
+    const requestedLevel = (hintLevel === 1 || hintLevel === 2 || hintLevel === 3 || hintLevel === 4)
       ? hintLevel
       : 1;
-    this._currentLevel = level as 1 | 2 | 3 | 4;
+
+    // =========================================================================
+    // CONFIG HINT LEVEL CLAMPING (Requirement A.5)
+    // =========================================================================
+    // Enforce instructor's maxHintLevel: clamp the level requested by the learner
+    // so they cannot bypass restrictions via direct postMessage or UI manipulation.
+    // Also format user message as "Requested hint level: N (course maximum: M)".
+    const effectiveMax = this._currentConfig.maxHintLevel;
+    const clampedLevel = Math.min(requestedLevel, effectiveMax) as 1 | 2 | 3 | 4;
+    this._currentLevel = clampedLevel;
     this._currentMode = 'task';
 
-    // 1. Build editor context block
     const contextBlock = this._buildEditorContextBlock();
 
-    // 2. Put context in user message and append "Requested hint level: N"
-    let userMessageContent = `${trimmedText}\n\nRequested hint level: ${this._currentLevel}`;
+    let hintLevelLabel = `Requested hint level: ${this._currentLevel}`;
+    if (this._activeConfig) {
+      hintLevelLabel = `Requested hint level: ${this._currentLevel} (course maximum: ${effectiveMax})`;
+    }
+
+    let userMessageContent = `${trimmedText}\n\n${hintLevelLabel}`;
     if (contextBlock) {
-      userMessageContent = `${contextBlock}\n\nLearner Question:\n${trimmedText}\n\nRequested hint level: ${this._currentLevel}`;
+      userMessageContent = `${contextBlock}\n\nLearner Question:\n${trimmedText}\n\n${hintLevelLabel}`;
     }
 
     await this._executePrompt(userMessageContent, 'task');
   }
 
   /**
-   * Handles "Need more help?" by re-asking the same learner task at the next level.
+   * Handles "Need more help?" with instructor config clamping.
    */
   private async _handleNeedMoreHelp(hintLevel?: number) {
     const taskText = this._currentTaskText.trim();
@@ -410,81 +538,77 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const level = (hintLevel === 1 || hintLevel === 2 || hintLevel === 3 || hintLevel === 4)
+    const effectiveMax = this._currentConfig.maxHintLevel;
+    const requestedLevel = (hintLevel === 1 || hintLevel === 2 || hintLevel === 3 || hintLevel === 4)
       ? hintLevel
-      : Math.min(4, this._currentLevel + 1);
-    this._currentLevel = level as 1 | 2 | 3 | 4;
+      : Math.min(effectiveMax, this._currentLevel + 1);
+
+    // =========================================================================
+    // CONFIG HINT LEVEL CLAMPING (Requirement A.5)
+    // =========================================================================
+    const clampedLevel = Math.min(requestedLevel, effectiveMax) as 1 | 2 | 3 | 4;
+    this._currentLevel = clampedLevel;
     this._currentMode = 'task';
 
-    // Build editor context block
     const contextBlock = this._buildEditorContextBlock();
 
-    // Append "Requested hint level: N"
-    let userMessageContent = `${taskText}\n\nRequested hint level: ${this._currentLevel}`;
+    let hintLevelLabel = `Requested hint level: ${this._currentLevel}`;
+    if (this._activeConfig) {
+      hintLevelLabel = `Requested hint level: ${this._currentLevel} (course maximum: ${effectiveMax})`;
+    }
+
+    let userMessageContent = `${taskText}\n\n${hintLevelLabel}`;
     if (contextBlock) {
-      userMessageContent = `${contextBlock}\n\nLearner Question:\n${taskText}\n\nRequested hint level: ${this._currentLevel}`;
+      userMessageContent = `${contextBlock}\n\nLearner Question:\n${taskText}\n\n${hintLevelLabel}`;
     }
 
     await this._executePrompt(userMessageContent, 'task');
   }
 
   /**
-   * Shared prompt executor with complete error handling (missing key, network, API errors, 429 rate limit).
-   * Mode handling:
-   * - Tracks current mode ('task' | 'explain' | 'review' | 'explain_back') and delivers it with the reply payload.
-   * - Persists learned concepts into context.globalState under "mentor.concepts" after every successful reply.
+   * Shared prompt executor.
+   * Passes dynamic instructor config and active status to askMentor.
    */
   private async _executePrompt(
     userMessageContent: string,
-    mode: 'task' | 'explain' | 'review' | 'explain_back'
+    mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check'
   ): Promise<void> {
     if (!this._view) {
       return;
     }
 
-    // 1. Store learner's message in history
     this._history.push({
       role: 'user',
       content: userMessageContent
     });
 
-    // Notify webview to show loading indicator
     this._postMessageToWebview({
       type: 'loading',
       loading: true
     });
 
     try {
-      // 2. Request response from Google Gemini via askMentor
-      const rawReply = await askMentor(this._history);
+      // Pass active instructor configuration to askMentor
+      const rawReply = await askMentor(this._history, this._currentConfig, this._activeConfig);
 
-      // 3. Store raw reply in history for conversational continuity
       this._history.push({
         role: 'assistant',
         content: rawReply
       });
 
-      // 4. Safely parse into structured MentorReply (never throws)
       const structuredReply: MentorReply = parseMentorReply(rawReply);
 
-      // =======================================================================
-      // GLOBALSTATE CONCEPT TRACKING (Requirement C)
-      // =======================================================================
-      // Update globalState under key "mentor.concepts" with normalized concept names.
-      // Wrapped in try/catch in saveConcepts so a storage error never breaks the chat.
+      // Persist identified concepts to globalState
       if (Array.isArray(structuredReply.concept) && structuredReply.concept.length > 0) {
         await saveConcepts(structuredReply.concept, this._globalState);
       }
 
-      // 5. Deliver structured reply to webview along with the explicit mode
-      // Mode controls which UI cards, buttons, badges, and actions display in the webview
       this._postMessageToWebview({
         type: 'reply',
         data: structuredReply,
         mode: mode
       });
     } catch (error: any) {
-      // Comprehensive error handling
       let errorMessage = 'An unexpected error occurred while communicating with Code Mentor.';
       let isApiKeyError = false;
 
@@ -518,7 +642,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         errorMessage = `Gemini API error: ${error.message}`;
       }
 
-      // Remove the last unanswered user turn so learner can retry cleanly
       this._history.pop();
 
       this._postMessageToWebview({
@@ -527,7 +650,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         isApiKeyError: isApiKeyError
       });
     } finally {
-      // Always stop the loading indicator
       this._postMessageToWebview({
         type: 'loading',
         loading: false
@@ -535,22 +657,12 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /**
-   * Helper to safely post typed messages to the webview.
-   */
   private _postMessageToWebview(message: any) {
     if (this._view) {
       this._view.webview.postMessage(message);
     }
   }
 
-  /**
-   * Builds the editor context block for the current request.
-   * Includes:
-   * - active file name and language ID
-   * - current selection (if any), labeled "Selected code"
-   * - full file, truncated to ~300 lines, labeled "Current file"
-   */
   private _buildEditorContextBlock(): string | null {
     const editor = vscode.window.activeTextEditor || vscode.window.visibleTextEditors[0];
     if (!editor || !editor.document) {
@@ -561,7 +673,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     const filename = path.basename(doc.fileName);
     const languageId = doc.languageId || 'plaintext';
 
-    // 1. Current selection (if any)
     let selectedCodeSection = '';
     const selection = editor.selection;
     if (selection && !selection.isEmpty) {
@@ -571,7 +682,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    // 2. Full file truncated to ~300 lines
     const maxLines = 300;
     const totalLines = doc.lineCount;
     const isTruncated = totalLines > maxLines;
@@ -591,11 +701,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     return `Active file: ${filename}\nLanguage ID: ${languageId}\n\n${selectedCodeSection}${currentFileSection}`;
   }
 
-  /**
-   * Generates the plain HTML/CSS/JS document for the Webview.
-   * Uses only vanilla HTML and JavaScript (no frameworks).
-   * All styles use --vscode-* theme variables with zero hardcoded colors.
-   */
   private _getHtmlForWebview(_webview: vscode.Webview): string {
     return `<!DOCTYPE html>
 <html lang="en">
@@ -605,9 +710,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
   <title>Code Mentor</title>
   <style>
-    /* =============================================================
-       VS CODE THEME VARIABLES (Zero Hardcoded Colors)
-       ============================================================= */
     :root {
       --font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif);
       --font-size: var(--vscode-font-size, 13px);
@@ -633,11 +735,17 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     /* Header Bar */
     .chat-header {
       display: flex;
-      align-items: center;
-      justify-content: space-between;
+      flex-direction: column;
       padding: 8px 12px;
       border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.2)));
       background: var(--vscode-sideBarSectionHeader-background, transparent);
+      gap: 6px;
+    }
+
+    .header-top-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
       gap: 6px;
     }
 
@@ -675,6 +783,29 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     .header-actions button:hover {
       background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25));
+    }
+
+    /* Requirement A.6: Course settings active badge */
+    .course-badge-row {
+      display: none; /* hidden until active config arrives */
+    }
+
+    .course-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 10.5px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: var(--vscode-badge-background, rgba(128, 128, 128, 0.2));
+      color: var(--vscode-badge-foreground, var(--vscode-foreground));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.3));
+      cursor: help;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     /* Messages List */
@@ -742,7 +873,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       word-break: break-word;
     }
 
-    /* Notice Card (e.g. "Open a file with some code first") */
     .notice-card {
       background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
       border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
@@ -756,9 +886,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-foreground);
     }
 
-    /* =============================================================
-       MENTOR STRUCTURED REPLY CARD STYLING
-       ============================================================= */
+    /* Structured Mentor Card */
     .mentor-row {
       align-items: flex-start;
     }
@@ -777,7 +905,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       gap: 10px;
     }
 
-    /* Card Header: Name + Hint Level */
     .mentor-card-header {
       display: flex;
       align-items: center;
@@ -805,7 +932,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       letter-spacing: 0.3px;
     }
 
-    /* Explanation Message */
     .mentor-message-body {
       font-size: 12.5px;
       line-height: 1.5;
@@ -813,7 +939,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       word-break: break-word;
     }
 
-    /* Guiding Question in Italics */
     .mentor-question-box {
       font-style: italic;
       color: var(--vscode-textLink-foreground, var(--vscode-foreground));
@@ -825,7 +950,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       line-height: 1.45;
     }
 
-    /* Highlighted "Your Next Step" Box */
     .next-step-box {
       background: var(--vscode-welcomePage-tileBackground, var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.12)));
       border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.3));
@@ -904,9 +1028,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       opacity: 0.95;
     }
 
-    /* =============================================================
-       REVIEW FINDINGS (Requirement A.5)
-       ============================================================= */
+    /* Review Findings */
     .findings-container {
       display: flex;
       flex-direction: column;
@@ -961,9 +1083,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       margin-top: 2px;
     }
 
-    /* =============================================================
-       EXPLAIN IT BACK CARDS & BADGES (Requirement B.3)
-       ============================================================= */
+    /* Explain Back & Paste Check Cards */
     .explain-back-container {
       display: flex;
       flex-direction: column;
@@ -988,7 +1108,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       letter-spacing: 0.3px;
     }
 
-    /* Theme-aware colored badges with explicit text labels */
     .understanding-badge.badge-solid {
       background: var(--vscode-editorGutter-addedBackground, rgba(46, 160, 67, 0.25));
       color: var(--vscode-terminal-ansiGreen, var(--vscode-foreground));
@@ -1040,7 +1159,78 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       line-height: 1.45;
     }
 
-    /* Code Snippet Block with Copy Button */
+    /* Paste Check Inline Prompt Card (Requirement B.6) */
+    .paste-check-panel {
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.1));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      animation: fadeIn 0.15s ease-in-out;
+    }
+
+    .paste-check-header {
+      font-size: 12px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--vscode-textLink-foreground, inherit);
+    }
+
+    .pasted-code-details {
+      background: var(--vscode-textCodeBlock-background, rgba(0, 0, 0, 0.2));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.2));
+      border-radius: 4px;
+      padding: 6px 8px;
+      font-size: 11.5px;
+    }
+
+    .pasted-code-details summary {
+      cursor: pointer;
+      font-weight: 500;
+      opacity: 0.85;
+      outline: none;
+    }
+
+    .pasted-code-details pre {
+      margin-top: 6px;
+      overflow-x: auto;
+      max-height: 180px;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    textarea#paste-explain-input {
+      width: 100%;
+      min-height: 56px;
+      max-height: 130px;
+      padding: 6px 8px;
+      border: 1px solid var(--vscode-input-border, rgba(128, 128, 128, 0.3));
+      border-radius: 3px;
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      font-family: var(--font-family);
+      font-size: 12px;
+      resize: none;
+      outline: none;
+      line-height: 1.4;
+    }
+
+    textarea#paste-explain-input:focus {
+      border-color: var(--vscode-focusBorder);
+    }
+
+    .paste-check-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* Code Snippet Block */
     .code-snippet-container {
       border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
       border-radius: 4px;
@@ -1100,7 +1290,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       padding: 0;
     }
 
-    /* Concept Chips at Bottom */
+    /* Concept Chips */
     .concepts-box {
       display: flex;
       flex-wrap: wrap;
@@ -1233,9 +1423,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       gap: 8px;
     }
 
-    /* =============================================================
-       EXPLAIN IT BACK INLINE PANEL (Requirement B.1)
-       ============================================================= */
+    /* Explain It Back Inline Panel */
     .explain-back-section {
       display: flex;
       flex-direction: column;
@@ -1358,14 +1546,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       gap: 6px;
     }
 
-    .hint-ladder-label {
-      font-size: 10.5px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      opacity: 0.75;
-    }
-
     /* Soft confirmation banner */
     .solution-confirm-banner {
       background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.12));
@@ -1443,7 +1623,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       white-space: nowrap;
     }
 
-    .hint-btn:hover {
+    .hint-btn:hover:not(:disabled) {
       background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25));
     }
 
@@ -1452,6 +1632,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-button-foreground);
       border-color: var(--vscode-focusBorder, var(--vscode-button-background));
       font-weight: 600;
+    }
+
+    /* Requirement A.6: Disabled buttons above instructor maxHintLevel */
+    .hint-btn:disabled,
+    .hint-btn.disabled-by-course {
+      opacity: 0.45;
+      cursor: not-allowed;
+      border-style: dashed;
     }
 
     .input-wrapper {
@@ -1529,13 +1717,20 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
   <!-- Sidebar Header -->
   <div class="chat-header">
-    <div class="header-title">
-      <span>Code Mentor</span>
+    <div class="header-top-row">
+      <div class="header-title">
+        <span>Code Mentor</span>
+      </div>
+      <div class="header-actions">
+        <button id="review-code-btn" title="Review my current active file">🔍 Review my code</button>
+        <button id="new-task-btn" title="Clear conversation history and reset level to 1">+ New task</button>
+      </div>
     </div>
-    <div class="header-actions">
-      <!-- Requirement A.1: "Review my code" button in sidebar header -->
-      <button id="review-code-btn" title="Review my current active file">🔍 Review my code</button>
-      <button id="new-task-btn" title="Clear conversation history and reset level to 1">+ New task</button>
+    <!-- Requirement A.6: Course settings active badge -->
+    <div class="course-badge-row" id="course-badge-row">
+      <span class="course-badge" id="course-badge" title="Course configuration active">
+        📚 Course settings active · max hint: <span id="course-max-hint-name">Solution</span>
+      </span>
     </div>
   </div>
 
@@ -1548,7 +1743,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         <div>• Choose your hint ladder level: Nudge (1), Hint (2), Structure (3), or Solution (4)</div>
         <div>• Click <b>🔍 Review my code</b> to get an educational review of your current file</div>
         <div>• Right-click any selected code and choose <b>Mentor: Explain Selection</b></div>
-        <div>• Click <b>✓ I finished this feature</b> to explain it in your own words and verify your understanding</div>
+        <div>• Click <b>✓ I finished this feature</b> to explain it in your own words</div>
       </div>
     </div>
   </div>
@@ -1565,7 +1760,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
   <!-- Chat Footer -->
   <div class="chat-footer">
-    <!-- Requirement B.1: "I finished this feature" button and inline explain-back panel -->
+    <!-- Explain It Back Section -->
     <div class="explain-back-section" id="explain-back-section" style="display: none;">
       <button type="button" class="finish-feature-btn" id="finish-feature-btn">
         <span>✓ I finished this feature</span>
@@ -1585,7 +1780,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     <!-- Hint Ladder Section -->
     <div class="hint-ladder-container">
-      <!-- Soft Confirmation Banner for Solution (4) -->
       <div class="solution-confirm-banner" id="solution-confirm" style="display: none;">
         <div class="solution-confirm-text">Want to try the Structure hint first?</div>
         <div class="solution-confirm-actions">
@@ -1594,7 +1788,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         </div>
       </div>
 
-      <!-- 4 Ladder Buttons -->
       <div class="hint-buttons-row">
         <button type="button" class="hint-btn active" data-level="1" id="hint-btn-1" title="Level 1: Nudge (gentle direction, no code)">Nudge (1)</button>
         <button type="button" class="hint-btn" data-level="2" id="hint-btn-2" title="Level 2: Hint (idea and what to look for)">Hint (2)</button>
@@ -1614,9 +1807,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   </div>
 
   <script>
-    // =========================================================================
-    // WEBVIEW <-> EXTENSION HOST MESSAGE PASSING BRIDGE
-    // =========================================================================
     const vscode = acquireVsCodeApi();
 
     const messagesContainer = document.getElementById('messages-container');
@@ -1627,7 +1817,12 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     const newTaskBtn = document.getElementById('new-task-btn');
     const reviewCodeBtn = document.getElementById('review-code-btn');
 
-    // Explain It Back elements (Requirement B.1)
+    // Course settings elements
+    const courseBadgeRow = document.getElementById('course-badge-row');
+    const courseBadge = document.getElementById('course-badge');
+    const courseMaxHintName = document.getElementById('course-max-hint-name');
+
+    // Explain It Back elements
     const explainBackSection = document.getElementById('explain-back-section');
     const finishFeatureBtn = document.getElementById('finish-feature-btn');
     const explainBackPanel = document.getElementById('explain-back-panel');
@@ -1648,20 +1843,72 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     const confirmSolutionBtn = document.getElementById('confirm-solution-btn');
 
     let currentHintLevel = 1;
+    let maxAllowedHintLevel = 4;
+    let isCourseActive = false;
+    let currentConfigObj = null;
     let isLoading = false;
-    let hasReplies = false; // Tracks if at least one reply has been received
+    let hasReplies = false;
 
-    // Notify extension host that webview is fully loaded and ready to receive messages
+    // Notify extension host that webview is ready
     vscode.postMessage({ type: 'ready' });
 
     // -------------------------------------------------------------------------
-    // HINT LADDER MANAGEMENT
+    // INSTRUCTOR CONFIGURATION SYNC (Requirement A.6)
     // -------------------------------------------------------------------------
+    function applyConfig(config, active) {
+      currentConfigObj = config;
+      isCourseActive = active;
+      maxAllowedHintLevel = (config && config.maxHintLevel) ? config.maxHintLevel : 4;
+
+      if (active && courseBadgeRow && courseBadge) {
+        courseBadgeRow.style.display = 'block';
+        if (courseMaxHintName) {
+          courseMaxHintName.textContent = getHintName(maxAllowedHintLevel);
+        }
+
+        // Build rich tooltip detailing course settings & learning objectives
+        let tooltip = 'Instructor Settings (.mentor.json)\\n' +
+                      'Mode: ' + config.mode + '\\n' +
+                      'Max hint level: ' + maxAllowedHintLevel + ' (' + getHintName(maxAllowedHintLevel) + ')';
+        if (Array.isArray(config.learningObjectives) && config.learningObjectives.length > 0) {
+          tooltip += '\\n\\nLearning objectives:\\n';
+          config.learningObjectives.forEach(function(obj) {
+            tooltip += '• ' + obj + '\\n';
+          });
+        }
+        courseBadge.title = tooltip.trim();
+      } else if (courseBadgeRow) {
+        courseBadgeRow.style.display = 'none';
+      }
+
+      // Update Hint Ladder buttons according to maxHintLevel
+      for (let i = 1; i <= 4; i++) {
+        const btn = hintBtns[i];
+        if (btn) {
+          if (i > maxAllowedHintLevel) {
+            btn.disabled = true;
+            btn.title = "Limited by your instructor's .mentor.json";
+            btn.classList.add('disabled-by-course');
+          } else {
+            btn.disabled = false;
+            btn.title = 'Level ' + i + ': ' + getHintName(i) + ' ' + getHintDescription(i);
+            btn.classList.remove('disabled-by-course');
+          }
+        }
+      }
+
+      // Clamp current level if above limit
+      if (currentHintLevel > maxAllowedHintLevel) {
+        selectHintLevel(maxAllowedHintLevel);
+      }
+    }
+
     function selectHintLevel(level) {
-      currentHintLevel = level;
+      // Clamp to maximum allowed level
+      currentHintLevel = Math.min(level, maxAllowedHintLevel);
       for (let i = 1; i <= 4; i++) {
         if (hintBtns[i]) {
-          if (i === level) {
+          if (i === currentHintLevel) {
             hintBtns[i].classList.add('active');
           } else {
             hintBtns[i].classList.remove('active');
@@ -1671,7 +1918,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     function showSolutionConfirmation() {
-      if (solutionConfirmBanner) {
+      // Requirement A.6: Solution soft-confirmation only applies if level 4 is allowed
+      if (maxAllowedHintLevel >= 4 && solutionConfirmBanner) {
         solutionConfirmBanner.style.display = 'flex';
       }
     }
@@ -1683,8 +1931,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     function handleHintBtnClick(level) {
-      // Soft confirmation inside webview when clicking Solution (4) while level is below 3
-      if (level === 4 && currentHintLevel < 3) {
+      if (level > maxAllowedHintLevel) {
+        return;
+      }
+      if (level === 4 && currentHintLevel < 3 && maxAllowedHintLevel >= 4) {
         showSolutionConfirmation();
         return;
       }
@@ -1692,7 +1942,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       selectHintLevel(level);
     }
 
-    // Attach listeners to Hint Ladder buttons
     [1, 2, 3, 4].forEach(function(lvl) {
       if (hintBtns[lvl]) {
         hintBtns[lvl].addEventListener('click', function() {
@@ -1701,7 +1950,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    // Soft confirmation actions
     if (confirmStructureBtn) {
       confirmStructureBtn.addEventListener('click', function() {
         hideSolutionConfirmation();
@@ -1719,7 +1967,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     // -------------------------------------------------------------------------
     // HEADER & EXPLAIN BACK ACTIONS
     // -------------------------------------------------------------------------
-    // Requirement A.1: "Review my code" header button
     if (reviewCodeBtn) {
       reviewCodeBtn.addEventListener('click', function() {
         if (isLoading) return;
@@ -1727,7 +1974,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    // Requirement B.1: "I finished this feature" button toggles inline panel
     if (finishFeatureBtn) {
       finishFeatureBtn.addEventListener('click', function() {
         finishFeatureBtn.style.display = 'none';
@@ -1743,7 +1989,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    // Requirement B.1: Disable submit until text has at least 15 characters
     if (explainBackInput) {
       explainBackInput.addEventListener('input', function() {
         const text = explainBackInput.value.trim();
@@ -1757,13 +2002,11 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    // Requirement B.2: Submit explanation
     if (submitExplainBtn) {
       submitExplainBtn.addEventListener('click', function() {
         const text = explainBackInput.value.trim();
         if (text.length < 15 || isLoading) return;
 
-        // Reset and hide panel
         explainBackPanel.style.display = 'none';
         finishFeatureBtn.style.display = 'inline-flex';
         explainBackInput.value = '';
@@ -1772,10 +2015,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           explainCharCount.textContent = '0 / 15 chars min';
         }
 
-        // Show learner message bubble
         appendUserMessage('Explaining my understanding:\\n' + text);
 
-        // Send to extension host
         vscode.postMessage({
           type: 'explainBack',
           explanation: text
@@ -1792,29 +2033,24 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // Hide welcome card upon first user interaction
       if (welcomeCard) {
         welcomeCard.style.display = 'none';
       }
 
-      // Render the user's message immediately in the UI
       appendUserMessage(text);
 
-      // Post message to extension host with the selected hint level
       vscode.postMessage({
         type: 'ask',
         text: text,
         hintLevel: currentHintLevel
       });
 
-      // Clear input field and reset height
       userInput.value = '';
       userInput.style.height = 'auto';
     }
 
     sendBtn.addEventListener('click', sendMessage);
 
-    // Enter sends message; Shift+Enter creates a new line
     userInput.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -1822,13 +2058,11 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    // Auto-grow textarea as user enters multiple lines
     userInput.addEventListener('input', function() {
       userInput.style.height = 'auto';
       userInput.style.height = Math.min(userInput.scrollHeight, 140) + 'px';
     });
 
-    // "New task" button: clears history, resets level to 1, clears chat UI
     newTaskBtn.addEventListener('click', function() {
       vscode.postMessage({ type: 'newTask' });
     });
@@ -1840,22 +2074,29 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       const message = event.data;
 
       switch (message.type) {
+        case 'config': {
+          applyConfig(message.config, message.active);
+          break;
+        }
+
         case 'reply': {
-          // Received structured MentorReply data:
-          // { type: 'reply', data: MentorReply, mode: 'task' | 'explain' | 'review' | 'explain_back' }
           renderMentorReplyCard(message.data, message.mode);
           break;
         }
 
         case 'userMessage': {
-          // Extension emitted a learner message (e.g. "Reviewing app.js..." or "Explaining selection...")
           appendUserMessage(message.text);
           break;
         }
 
         case 'noticeMessage': {
-          // Requirement A.3: Friendly in-chat message when no active file or empty
           appendNoticeMessage(message.text);
+          break;
+        }
+
+        case 'pasteCheckPrompt': {
+          // Requirement B.6: Render inline panel for learner to explain pasted code
+          renderPasteCheckPrompt(message);
           break;
         }
 
@@ -1871,19 +2112,16 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
         case 'taskReset':
         case 'historyCleared': {
-          // Clear messages
           messagesContainer.innerHTML = '';
           if (welcomeCard) {
             welcomeCard.style.display = 'block';
             messagesContainer.appendChild(welcomeCard);
           }
-          // Reset hint level to 1
           selectHintLevel(1);
           hideSolutionConfirmation();
           userInput.value = '';
           userInput.style.height = 'auto';
 
-          // Reset "I finished this feature" visibility
           hasReplies = false;
           if (explainBackSection) {
             explainBackSection.style.display = 'none';
@@ -1911,7 +2149,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     // -------------------------------------------------------------------------
-    // RENDERING FUNCTIONS (Safe DOM Construction, Zero Raw innerHTML)
+    // RENDERING FUNCTIONS
     // -------------------------------------------------------------------------
     function setLoading(loading) {
       isLoading = loading;
@@ -1935,16 +2173,13 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       const bubble = document.createElement('div');
       bubble.className = 'user-bubble';
-      bubble.textContent = text; // Safe text insertion
+      bubble.textContent = text;
 
       row.appendChild(bubble);
       messagesContainer.appendChild(row);
       scrollToBottom();
     }
 
-    /**
-     * Appends a friendly in-chat notice card (e.g. "Open a file with some code first").
-     */
     function appendNoticeMessage(text) {
       if (welcomeCard) {
         welcomeCard.style.display = 'none';
@@ -1969,16 +2204,96 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     /**
+     * Requirement B.6: Renders inline prompt card in chat for explaining pasted code.
+     * Keeps code in memory only. Pasted code is escaped and enclosed in a collapsed <details>.
+     */
+    function renderPasteCheckPrompt(data) {
+      if (welcomeCard) {
+        welcomeCard.style.display = 'none';
+      }
+
+      const row = document.createElement('div');
+      row.className = 'message-row mentor-row';
+
+      const panel = document.createElement('div');
+      panel.className = 'paste-check-panel';
+
+      const header = document.createElement('div');
+      header.className = 'paste-check-header';
+      header.textContent = '📋 Big paste detected (' + (data.lineCount || 'several') + ' lines)';
+      panel.appendChild(header);
+
+      const details = document.createElement('details');
+      details.className = 'pasted-code-details';
+
+      const summary = document.createElement('summary');
+      summary.textContent = 'View pasted code in ' + data.fileName + ' (' + (data.isTruncated ? 'first 120 lines' : data.lineCount + ' lines') + ')';
+      details.appendChild(summary);
+
+      const pre = document.createElement('pre');
+      const code = document.createElement('code');
+      code.textContent = data.displayCode || data.code;
+      pre.appendChild(code);
+      details.appendChild(pre);
+      panel.appendChild(details);
+
+      const textarea = document.createElement('textarea');
+      textarea.id = 'paste-explain-input';
+      textarea.placeholder = 'In your own words, what does this code do?';
+      panel.appendChild(textarea);
+
+      const footer = document.createElement('div');
+      footer.className = 'paste-check-footer';
+
+      const charCount = document.createElement('span');
+      charCount.className = 'char-count';
+      charCount.textContent = '0 / 15 chars min';
+      footer.appendChild(charCount);
+
+      const submitBtn = document.createElement('button');
+      submitBtn.className = 'btn-submit-explain';
+      submitBtn.textContent = 'Submit Explanation';
+      submitBtn.disabled = true;
+      footer.appendChild(submitBtn);
+
+      panel.appendChild(footer);
+
+      textarea.addEventListener('input', function() {
+        const text = textarea.value.trim();
+        const len = text.length;
+        charCount.textContent = len + ' / 15 chars min';
+        submitBtn.disabled = len < 15;
+      });
+
+      submitBtn.addEventListener('click', function() {
+        const text = textarea.value.trim();
+        if (text.length < 15 || isLoading) return;
+
+        panel.style.display = 'none';
+        appendUserMessage('Explaining my understanding of pasted code:\\n' + text);
+
+        vscode.postMessage({
+          type: 'submitPasteCheck',
+          fileName: data.fileName,
+          languageId: data.languageId,
+          code: data.code,
+          explanation: text
+        });
+      });
+
+      row.appendChild(panel);
+      messagesContainer.appendChild(row);
+      scrollToBottom();
+      textarea.focus();
+    }
+
+    /**
      * renderMentorReplyCard:
-     * Renders a structured MentorReply response as a card in the chat.
      * Supports modes:
-     * - 'task': Default ladder card with hint badge and "Need more help?" button
-     * - 'explain': Explain mode with line notes (hides hint badge & need help button)
-     * - 'review': Review mode with findings cards (hides hint badge & need help button)
-     * - 'explain_back': Understanding check card with colored badge, got_right, and gaps (hides hint badge & need help button)
-     *
-     * @param {Object} reply - Structured MentorReply object
-     * @param {string} mode - 'task' | 'explain' | 'review' | 'explain_back'
+     * - 'task': Default ladder card
+     * - 'explain': Explain mode with line notes
+     * - 'review': Review mode with findings cards
+     * - 'explain_back' and 'paste_check': Understanding check cards
      */
     function renderMentorReplyCard(reply, mode) {
       if (!reply || typeof reply !== 'object') {
@@ -1997,7 +2312,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         };
       }
 
-      // Requirement B.1: Show "I finished this feature" once conversation has at least one reply
       hasReplies = true;
       if (explainBackSection) {
         explainBackSection.style.display = 'block';
@@ -2006,8 +2320,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       const isExplainMode = (mode === 'explain');
       const isReviewMode = (mode === 'review');
       const isExplainBackMode = (mode === 'explain_back');
-      // Hide hint ladder badge and "Need more help?" button for non-task modes
-      const hideLadderControls = isExplainMode || isReviewMode || isExplainBackMode;
+      const isPasteCheckMode = (mode === 'paste_check');
+      const hideLadderControls = isExplainMode || isReviewMode || isExplainBackMode || isPasteCheckMode;
 
       const row = document.createElement('div');
       row.className = 'message-row mentor-row';
@@ -2015,7 +2329,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       const card = document.createElement('div');
       card.className = 'mentor-card';
 
-      // 1. Header: Mentor label & optional Hint level badge
+      // 1. Header
       const header = document.createElement('div');
       header.className = 'mentor-card-header';
 
@@ -2030,9 +2344,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       } else if (isReviewMode) {
         iconSpan.textContent = '📋';
         nameSpan.textContent = 'Code Mentor (Review)';
-      } else if (isExplainBackMode) {
+      } else if (isExplainBackMode || isPasteCheckMode) {
         iconSpan.textContent = '🎯';
-        nameSpan.textContent = 'Code Mentor (Check)';
+        nameSpan.textContent = 'Code Mentor (Understanding Check)';
       } else {
         iconSpan.textContent = '🎓';
         nameSpan.textContent = 'Code Mentor';
@@ -2042,7 +2356,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       titleGroup.appendChild(nameSpan);
       header.appendChild(titleGroup);
 
-      // Only show Hint level label in standard task mode
       if (!hideLadderControls) {
         const hintBadge = document.createElement('span');
         hintBadge.className = 'hint-badge';
@@ -2054,7 +2367,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       card.appendChild(header);
 
-      // 2. Message explanation: normal text
+      // 2. Message explanation
       if (reply.message) {
         const messageEl = document.createElement('div');
         messageEl.className = 'mentor-message-body';
@@ -2062,7 +2375,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(messageEl);
       }
 
-      // 3. Line notes: list of code fragments with note (used in explain mode)
+      // 3. Line notes (used in explain mode)
       if (Array.isArray(reply.line_notes) && reply.line_notes.length > 0) {
         const validNotes = reply.line_notes.filter(function(n) {
           return n && (n.code || n.note);
@@ -2106,8 +2419,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      // 4. Requirement A.5: Findings list for review mode
-      // Render findings as a list of small cards: area as a bold label, observation as text, the question in italics.
+      // 4. Review findings
       if (Array.isArray(reply.findings) && reply.findings.length > 0) {
         const validFindings = reply.findings.filter(function(f) {
           return f && (f.area || f.observation || f.question);
@@ -2129,7 +2441,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             const itemCard = document.createElement('div');
             itemCard.className = 'finding-card';
 
-            // Area as bold label
             if (item.area && item.area.trim()) {
               const areaEl = document.createElement('div');
               areaEl.className = 'finding-area';
@@ -2137,7 +2448,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
               itemCard.appendChild(areaEl);
             }
 
-            // Observation as text
             if (item.observation && item.observation.trim()) {
               const obsEl = document.createElement('div');
               obsEl.className = 'finding-observation';
@@ -2145,7 +2455,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
               itemCard.appendChild(obsEl);
             }
 
-            // Question in italics
             if (item.question && item.question.trim()) {
               const qEl = document.createElement('div');
               qEl.className = 'finding-question';
@@ -2163,8 +2472,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      // 5. Requirement B.3: Explain It Back assessment card
-      // Badge for understanding (with text label), "What you got right" list, "What to revisit" list
+      // 5. Explain Back and Paste Check assessment card (Requirement B.6: SAME card)
       const hasExplainBackData = reply.understanding ||
         (Array.isArray(reply.got_right) && reply.got_right.length > 0) ||
         (Array.isArray(reply.gaps) && reply.gaps.length > 0);
@@ -2173,7 +2481,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         const evalContainer = document.createElement('div');
         evalContainer.className = 'explain-back-container';
 
-        // Colored badge for understanding (uses VS Code theme variables and explicit text)
         if (reply.understanding) {
           const badgeWrap = document.createElement('div');
           badgeWrap.className = 'understanding-badge-wrapper';
@@ -2195,7 +2502,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           evalContainer.appendChild(badgeWrap);
         }
 
-        // "What you got right" as a list
         if (Array.isArray(reply.got_right) && reply.got_right.length > 0) {
           const rightBox = document.createElement('div');
           rightBox.className = 'eval-section eval-right';
@@ -2218,7 +2524,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           evalContainer.appendChild(rightBox);
         }
 
-        // "What to revisit" as a list
         if (Array.isArray(reply.gaps) && reply.gaps.length > 0) {
           const gapsBox = document.createElement('div');
           gapsBox.className = 'eval-section eval-gaps';
@@ -2244,7 +2549,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(evalContainer);
       }
 
-      // 6. Guiding question: in italics (if present)
+      // 6. Guiding question
       if (reply.question && reply.question.trim()) {
         const questionBox = document.createElement('div');
         questionBox.className = 'mentor-question-box';
@@ -2256,7 +2561,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(questionBox);
       }
 
-      // 7. "Your next step" box (highlighted, if provided)
+      // 7. "Your next step" box
       if (reply.next_step && reply.next_step.trim()) {
         const nextStepBox = document.createElement('div');
         nextStepBox.className = 'next-step-box';
@@ -2274,7 +2579,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(nextStepBox);
       }
 
-      // 8. Code snippet: in <pre><code> block with Copy button
+      // 8. Code snippet block with Copy button
       if (reply.code_snippet && reply.code_snippet.trim()) {
         const snippetText = reply.code_snippet.trim();
 
@@ -2310,7 +2615,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(snippetContainer);
       }
 
-      // 9. Concept chips at bottom
+      // 9. Concept chips
       if (Array.isArray(reply.concept) && reply.concept.length > 0) {
         const validConcepts = reply.concept.filter(function(c) {
           return typeof c === 'string' && c.trim().length > 0;
@@ -2337,10 +2642,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       // 10. "Need more help?" button
-      // Only shown when in standard task mode and when hint level is below 4
+      // Requirement A.6: Hide once current level equals maximum allowed level
       if (!hideLadderControls) {
         const replyLevel = reply.hint_level || currentHintLevel || 1;
-        if (replyLevel < 4) {
+        if (replyLevel < maxAllowedHintLevel) {
           const nextLevel = replyLevel + 1;
           const needHelpBtn = document.createElement('button');
           needHelpBtn.className = 'need-help-btn';
@@ -2349,11 +2654,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
           needHelpBtn.addEventListener('click', function() {
             needHelpBtn.disabled = true;
-            // Update webview hint level selector
             selectHintLevel(nextLevel);
-            // Append learner row in chat so the request is visually recorded
             appendUserMessage('Need more help (' + getHintName(nextLevel) + ' ' + nextLevel + ')');
-            // Ask extension to re-query with the same task at the new level
             vscode.postMessage({
               type: 'needMoreHelp',
               hintLevel: nextLevel
@@ -2369,9 +2671,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       scrollToBottom();
     }
 
-    /**
-     * Copies code snippet text to clipboard with graceful fallback and user feedback.
-     */
     function copySnippetToClipboard(text, button) {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(function() {
@@ -2441,7 +2740,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       textEl.textContent = '⚠️ ' + errorText;
       card.appendChild(textEl);
 
-      // Provide direct button to settings for API key configuration
       if (isApiKeyError) {
         const actionBtn = document.createElement('button');
         actionBtn.className = 'btn-action';

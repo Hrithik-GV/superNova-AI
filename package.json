@@ -44,6 +44,10 @@
       {
         "command": "mentor.reviewFile",
         "title": "Mentor: Review My Code"
+      },
+      {
+        "command": "mentor.createConfig",
+        "title": "Mentor: Create Course Config (.mentor.json)"
       }
     ],
     "menus": {
