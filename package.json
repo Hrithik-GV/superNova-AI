@@ -36,15 +36,33 @@
       {
         "command": "mentor.openChat",
         "title": "Code Mentor: Open Chat"
+      },
+      {
+        "command": "mentor.explainSelection",
+        "title": "Mentor: Explain Selection"
       }
     ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "mentor.explainSelection",
+          "when": "editorHasSelection",
+          "group": "mentor"
+        }
+      ]
+    },
     "configuration": {
       "title": "Code Mentor",
       "properties": {
         "mentor.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Anthropic API key for Code Mentor (Anthropic Claude Haiku 5.5)."
+          "description": "Google Gemini API key for Code Mentor (e.g. from Google AI Studio)."
+        },
+        "mentor.model": {
+          "type": "string",
+          "default": "gemini-3.5-flash",
+          "description": "Gemini model to use for mentoring (e.g. gemini-3.5-flash, gemini-1.5-flash, gemini-2.0-flash)."
         }
       }
     }
@@ -60,6 +78,6 @@
     "typescript": "^5.6.3"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0"
+    "@google/generative-ai": "^0.24.1"
   }
 }
