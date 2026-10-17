@@ -1,14 +1,31 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { askMentor, parseMentorReply, ChatMessage, MentorReply, LineNote, MissingApiKeyError } from './llm';
+import {
+  askMentor,
+  parseMentorReply,
+  ChatMessage,
+  MentorReply,
+  LineNote,
+  ReviewFinding,
+  MissingApiKeyError
+} from './llm';
+import {
+  initProgress,
+  saveConcepts,
+  getConcepts
+} from './progress';
 
 /**
  * Activates the Code Mentor extension.
- * Sets up the WebviewViewProvider for the sidebar chat and registers commands.
+ * Sets up the WebviewViewProvider for the sidebar chat, initializes concept progress tracking,
+ * and registers extension commands.
  */
 export function activate(context: vscode.ExtensionContext) {
+  // Initialize progress tracking module with extension globalState
+  initProgress(context.globalState);
+
   // 1. Create and register the WebviewViewProvider for the sidebar chat
-  const provider = new MentorChatViewProvider(context.extensionUri);
+  const provider = new MentorChatViewProvider(context.extensionUri, context.globalState);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
@@ -62,6 +79,16 @@ export function activate(context: vscode.ExtensionContext) {
       await provider.explainSelection(fileName, languageId, selectedText);
     })
   );
+
+  // 4. Register command palette command: "Mentor: Review My Code" (command palette only)
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mentor.reviewFile', async () => {
+      // Capture the active editor before focusing the webview so focus change doesn't clear it
+      const editor = vscode.window.activeTextEditor;
+      await vscode.commands.executeCommand('mentor.chat.focus');
+      await provider.reviewActiveFile(editor);
+    })
+  );
 }
 
 export function deactivate() {
@@ -82,13 +109,19 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   // Per-task state retained on the extension host
   private _currentLevel: 1 | 2 | 3 | 4 = 1;
   private _currentTaskText: string = '';
-  private _currentMode: 'task' | 'explain' = 'task';
+  // Tracks active interaction mode: 'task' (normal ladder), 'explain', 'review', or 'explain_back'
+  private _currentMode: 'task' | 'explain' | 'review' | 'explain_back' = 'task';
 
-  // Webview lifecycle readiness and queued pending explain requests
+  // Webview lifecycle readiness and queued pending requests for when sidebar is closed
   private _isWebviewReady: boolean = false;
   private _pendingExplain: { fileName: string; languageId: string; code: string } | null = null;
+  private _pendingReview: { fileName: string; languageId: string; code: string } | null = null;
+  private _pendingNotice: string | null = null;
 
-  constructor(private readonly _extensionUri: vscode.Uri) {}
+  constructor(
+    private readonly _extensionUri: vscode.Uri,
+    private readonly _globalState: vscode.Memento
+  ) {}
 
   public resolveWebviewView(
     webviewView: vscode.WebviewView,
@@ -115,10 +148,23 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         case 'ready': {
           // Webview has loaded and its message listener is registered
           this._isWebviewReady = true;
-          if (this._pendingExplain) {
+
+          // Dispatch any actions queued while sidebar was closed
+          if (this._pendingNotice) {
+            const notice = this._pendingNotice;
+            this._pendingNotice = null;
+            this._postMessageToWebview({
+              type: 'noticeMessage',
+              text: notice
+            });
+          } else if (this._pendingExplain) {
             const pending = this._pendingExplain;
             this._pendingExplain = null;
             await this._executeExplain(pending.fileName, pending.languageId, pending.code);
+          } else if (this._pendingReview) {
+            const pending = this._pendingReview;
+            this._pendingReview = null;
+            await this._executeReview(pending.fileName, pending.languageId, pending.code);
           }
           break;
         }
@@ -132,6 +178,18 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         case 'needMoreHelp': {
           // Learner clicked "Need more help?" to move up one level on the current task
           await this._handleNeedMoreHelp(message.hintLevel);
+          break;
+        }
+
+        case 'reviewFile': {
+          // Learner clicked "Review my code" in sidebar header
+          await this.reviewActiveFile();
+          break;
+        }
+
+        case 'explainBack': {
+          // Learner submitted their own understanding check
+          await this._handleExplainBack(message.explanation);
           break;
         }
 
@@ -200,6 +258,121 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Entry point for Review My Code:
+   * Gathers active file name, languageId, and content (truncated at ~300 lines).
+   * If there is no active editor or file is empty, shows friendly in-chat notice without calling LLM.
+   * Reuses the 'ready' handshake and queue when sidebar was closed.
+   */
+  public async reviewActiveFile(editor?: vscode.TextEditor): Promise<void> {
+    // Check passed editor, activeTextEditor, or first visible editor (handles webview focus)
+    const targetEditor = editor || vscode.window.activeTextEditor || vscode.window.visibleTextEditors[0];
+    if (!targetEditor || !targetEditor.document) {
+      this._handleNoActiveFileForReview();
+      return;
+    }
+
+    const doc = targetEditor.document;
+    const fullText = doc.getText().trim();
+    if (!fullText) {
+      this._handleNoActiveFileForReview();
+      return;
+    }
+
+    const fileName = path.basename(doc.fileName);
+    const languageId = doc.languageId || 'plaintext';
+
+    // Truncate file at ~300 lines
+    const totalLines = doc.lineCount;
+    let code = doc.getText();
+    if (totalLines > 300) {
+      const endLine = 299;
+      const endChar = doc.lineAt(endLine).text.length;
+      code = doc.getText(new vscode.Range(0, 0, endLine, endChar)) + '\n\n// ... (file truncated to 300 lines)';
+    }
+
+    // If webview is not ready yet, queue the review request
+    if (!this._view || !this._isWebviewReady) {
+      this._pendingReview = { fileName, languageId, code };
+      return;
+    }
+
+    await this._executeReview(fileName, languageId, code);
+  }
+
+  /**
+   * Shows a friendly in-chat message when review is triggered without an active/non-empty file.
+   * Does NOT call the LLM.
+   */
+  private _handleNoActiveFileForReview(): void {
+    const notice = 'Open a file with some code first';
+    if (!this._view || !this._isWebviewReady) {
+      this._pendingNotice = notice;
+    } else {
+      this._postMessageToWebview({
+        type: 'noticeMessage',
+        text: notice
+      });
+    }
+  }
+
+  /**
+   * Executes a review request once the webview is ready.
+   */
+  private async _executeReview(fileName: string, languageId: string, code: string): Promise<void> {
+    this._currentMode = 'review';
+    this._currentTaskText = `Review ${fileName}`;
+
+    // Show a short learner-side line in the chat: "Reviewing <file name>..."
+    this._postMessageToWebview({
+      type: 'userMessage',
+      text: `Reviewing ${fileName}...`
+    });
+
+    // Build the user message for review mode
+    const prompt = `Mode: review\nFile: ${fileName} (${languageId})\nCurrent file:\n${code}`;
+
+    await this._executePrompt(prompt, 'review');
+  }
+
+  /**
+   * Handles "Explain it back" submission from the learner.
+   * Gathers original task text and active file content (truncated to ~300 lines).
+   * If there is no active file, sends prompt without the file section.
+   */
+  private async _handleExplainBack(learnerExplanation: string): Promise<void> {
+    const trimmedExplanation = (learnerExplanation || '').trim();
+    if (!trimmedExplanation) {
+      return;
+    }
+
+    this._currentMode = 'explain_back';
+    const task = this._currentTaskText || 'Current coding task';
+
+    // Gather active file content if present
+    const targetEditor = vscode.window.activeTextEditor || vscode.window.visibleTextEditors[0];
+    let fileSection = '';
+    if (targetEditor && targetEditor.document) {
+      const doc = targetEditor.document;
+      const fullText = doc.getText().trim();
+      if (fullText) {
+        const totalLines = doc.lineCount;
+        let code = doc.getText();
+        if (totalLines > 300) {
+          const endLine = 299;
+          const endChar = doc.lineAt(endLine).text.length;
+          code = doc.getText(new vscode.Range(0, 0, endLine, endChar)) + '\n\n// ... (file truncated to 300 lines)';
+        }
+        fileSection = `\nCurrent file:\n${code}`;
+      }
+    }
+
+    // Build user message for explain_back mode
+    const prompt = `Mode: explain_back\nTask: ${task}${fileSection}\nLearner's explanation:\n${trimmedExplanation}`;
+
+    await this._executePrompt(prompt, 'explain_back');
+  }
+
+  /**
    * Processes a learner question from the chat input.
    */
   private async _handleUserAsk(userText: string, hintLevel?: number) {
@@ -257,8 +430,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
   /**
    * Shared prompt executor with complete error handling (missing key, network, API errors, 429 rate limit).
+   * Mode handling:
+   * - Tracks current mode ('task' | 'explain' | 'review' | 'explain_back') and delivers it with the reply payload.
+   * - Persists learned concepts into context.globalState under "mentor.concepts" after every successful reply.
    */
-  private async _executePrompt(userMessageContent: string, mode: 'task' | 'explain'): Promise<void> {
+  private async _executePrompt(
+    userMessageContent: string,
+    mode: 'task' | 'explain' | 'review' | 'explain_back'
+  ): Promise<void> {
     if (!this._view) {
       return;
     }
@@ -288,7 +467,17 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       // 4. Safely parse into structured MentorReply (never throws)
       const structuredReply: MentorReply = parseMentorReply(rawReply);
 
-      // 5. Deliver structured reply to webview along with the mode
+      // =======================================================================
+      // GLOBALSTATE CONCEPT TRACKING (Requirement C)
+      // =======================================================================
+      // Update globalState under key "mentor.concepts" with normalized concept names.
+      // Wrapped in try/catch in saveConcepts so a storage error never breaks the chat.
+      if (Array.isArray(structuredReply.concept) && structuredReply.concept.length > 0) {
+        await saveConcepts(structuredReply.concept, this._globalState);
+      }
+
+      // 5. Deliver structured reply to webview along with the explicit mode
+      // Mode controls which UI cards, buttons, badges, and actions display in the webview
       this._postMessageToWebview({
         type: 'reply',
         data: structuredReply,
@@ -363,7 +552,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
    * - full file, truncated to ~300 lines, labeled "Current file"
    */
   private _buildEditorContextBlock(): string | null {
-    const editor = vscode.window.activeTextEditor;
+    const editor = vscode.window.activeTextEditor || vscode.window.visibleTextEditors[0];
     if (!editor || !editor.document) {
       return null;
     }
@@ -446,9 +635,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 10px 12px;
+      padding: 8px 12px;
       border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.2)));
       background: var(--vscode-sideBarSectionHeader-background, transparent);
+      gap: 6px;
     }
 
     .header-title {
@@ -460,6 +650,13 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       align-items: center;
       gap: 6px;
       color: var(--vscode-sideBarTitle-foreground, inherit);
+      flex-shrink: 0;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
 
     .header-actions button {
@@ -473,6 +670,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       border-radius: 3px;
       font-family: inherit;
       transition: background 0.15s ease;
+      white-space: nowrap;
     }
 
     .header-actions button:hover {
@@ -542,6 +740,20 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       line-height: 1.45;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+
+    /* Notice Card (e.g. "Open a file with some code first") */
+    .notice-card {
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
+      border-left: 3px solid var(--vscode-textLink-foreground, #007acc);
+      border-radius: 4px;
+      padding: 10px 12px;
+      font-size: 12.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--vscode-foreground);
     }
 
     /* =============================================================
@@ -690,6 +902,142 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       font-size: 12px;
       line-height: 1.4;
       opacity: 0.95;
+    }
+
+    /* =============================================================
+       REVIEW FINDINGS (Requirement A.5)
+       ============================================================= */
+    .findings-container {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 2px;
+    }
+
+    .findings-title {
+      font-size: 10.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      opacity: 0.85;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .findings-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .finding-card {
+      background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.2));
+      border-left: 3px solid var(--vscode-textLink-foreground, #007acc);
+      border-radius: 0 4px 4px 0;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .finding-area {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--vscode-foreground);
+    }
+
+    .finding-observation {
+      font-size: 12px;
+      line-height: 1.45;
+      opacity: 0.95;
+    }
+
+    .finding-question {
+      font-size: 11.5px;
+      font-style: italic;
+      color: var(--vscode-textLink-foreground, var(--vscode-foreground));
+      margin-top: 2px;
+    }
+
+    /* =============================================================
+       EXPLAIN IT BACK CARDS & BADGES (Requirement B.3)
+       ============================================================= */
+    .explain-back-container {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 2px;
+    }
+
+    .understanding-badge-wrapper {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .understanding-badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 9px;
+      border-radius: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      letter-spacing: 0.3px;
+    }
+
+    /* Theme-aware colored badges with explicit text labels */
+    .understanding-badge.badge-solid {
+      background: var(--vscode-editorGutter-addedBackground, rgba(46, 160, 67, 0.25));
+      color: var(--vscode-terminal-ansiGreen, var(--vscode-foreground));
+      border: 1px solid var(--vscode-editorGutter-addedBackground, rgba(46, 160, 67, 0.5));
+    }
+
+    .understanding-badge.badge-partial {
+      background: var(--vscode-editorWarning-background, rgba(210, 153, 34, 0.25));
+      color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+      border: 1px solid var(--vscode-editorWarning-border, rgba(210, 153, 34, 0.5));
+    }
+
+    .understanding-badge.badge-shaky {
+      background: var(--vscode-editorError-background, rgba(248, 81, 73, 0.25));
+      color: var(--vscode-editorError-foreground, var(--vscode-foreground));
+      border: 1px solid var(--vscode-editorError-border, rgba(248, 81, 73, 0.5));
+    }
+
+    .eval-section {
+      background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.2));
+      border-radius: 4px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .eval-section.eval-right {
+      border-left: 3px solid var(--vscode-terminal-ansiGreen, #2ea043);
+    }
+
+    .eval-section.eval-gaps {
+      border-left: 3px solid var(--vscode-editorWarning-foreground, #d29922);
+    }
+
+    .eval-title {
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+
+    .eval-list {
+      margin-left: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      font-size: 12px;
+      line-height: 1.45;
     }
 
     /* Code Snippet Block with Copy Button */
@@ -877,12 +1225,130 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     /* Chat Footer */
     .chat-footer {
-      padding: 10px 12px;
+      padding: 8px 12px 10px 12px;
       border-top: 1px solid var(--vscode-sideBarSectionHeader-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.2)));
       background: var(--vscode-sideBar-background);
       display: flex;
       flex-direction: column;
       gap: 8px;
+    }
+
+    /* =============================================================
+       EXPLAIN IT BACK INLINE PANEL (Requirement B.1)
+       ============================================================= */
+    .explain-back-section {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .finish-feature-btn {
+      align-self: flex-start;
+      background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.15));
+      color: var(--vscode-button-secondaryForeground, inherit);
+      border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.25));
+      border-radius: 3px;
+      padding: 4px 10px;
+      font-size: 11.5px;
+      font-weight: 500;
+      cursor: pointer;
+      font-family: inherit;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: background 0.15s ease;
+    }
+
+    .finish-feature-btn:hover {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25));
+    }
+
+    .explain-back-panel {
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.1));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
+      border-radius: 4px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      animation: fadeIn 0.15s ease-in-out;
+    }
+
+    .explain-back-panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+
+    .btn-close-panel {
+      background: transparent;
+      border: none;
+      color: var(--vscode-foreground);
+      opacity: 0.6;
+      cursor: pointer;
+      font-size: 12px;
+      padding: 2px 4px;
+      border-radius: 2px;
+    }
+
+    .btn-close-panel:hover {
+      opacity: 1;
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.2));
+    }
+
+    textarea#explain-back-input {
+      width: 100%;
+      min-height: 54px;
+      max-height: 120px;
+      padding: 6px 8px;
+      border: 1px solid var(--vscode-input-border, rgba(128, 128, 128, 0.3));
+      border-radius: 3px;
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      font-family: var(--font-family);
+      font-size: 12px;
+      resize: none;
+      outline: none;
+      line-height: 1.4;
+    }
+
+    textarea#explain-back-input:focus {
+      border-color: var(--vscode-focusBorder);
+    }
+
+    .explain-back-panel-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .char-count {
+      font-size: 10.5px;
+      opacity: 0.7;
+    }
+
+    .btn-submit-explain {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 500;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .btn-submit-explain:hover:not(:disabled) {
+      background: var(--vscode-button-hoverBackground);
+    }
+
+    .btn-submit-explain:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
 
     /* Hint Ladder */
@@ -1067,6 +1533,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       <span>Code Mentor</span>
     </div>
     <div class="header-actions">
+      <!-- Requirement A.1: "Review my code" button in sidebar header -->
+      <button id="review-code-btn" title="Review my current active file">🔍 Review my code</button>
       <button id="new-task-btn" title="Clear conversation history and reset level to 1">+ New task</button>
     </div>
   </div>
@@ -1078,8 +1546,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       <p>I'm here to teach you how to code, explain concepts step-by-step, and guide you without writing all the code for you.</p>
       <div class="welcome-tips">
         <div>• Choose your hint ladder level: Nudge (1), Hint (2), Structure (3), or Solution (4)</div>
+        <div>• Click <b>🔍 Review my code</b> to get an educational review of your current file</div>
         <div>• Right-click any selected code and choose <b>Mentor: Explain Selection</b></div>
-        <div>• Ask "Need more help?" at any point to step up to the next hint level</div>
+        <div>• Click <b>✓ I finished this feature</b> to explain it in your own words and verify your understanding</div>
       </div>
     </div>
   </div>
@@ -1096,6 +1565,24 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
   <!-- Chat Footer -->
   <div class="chat-footer">
+    <!-- Requirement B.1: "I finished this feature" button and inline explain-back panel -->
+    <div class="explain-back-section" id="explain-back-section" style="display: none;">
+      <button type="button" class="finish-feature-btn" id="finish-feature-btn">
+        <span>✓ I finished this feature</span>
+      </button>
+      <div class="explain-back-panel" id="explain-back-panel" style="display: none;">
+        <div class="explain-back-panel-header">
+          <span>Explain in your own words how this works</span>
+          <button type="button" class="btn-close-panel" id="close-explain-panel" title="Close panel">✕</button>
+        </div>
+        <textarea id="explain-back-input" placeholder="Explain in your own words how this works..."></textarea>
+        <div class="explain-back-panel-footer">
+          <span class="char-count" id="explain-char-count">0 / 15 chars min</span>
+          <button type="button" class="btn-submit-explain" id="submit-explain-btn" disabled>Submit</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Hint Ladder Section -->
     <div class="hint-ladder-container">
       <!-- Soft Confirmation Banner for Solution (4) -->
@@ -1138,6 +1625,16 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     const sendBtn = document.getElementById('send-btn');
     const loadingIndicator = document.getElementById('loading-indicator');
     const newTaskBtn = document.getElementById('new-task-btn');
+    const reviewCodeBtn = document.getElementById('review-code-btn');
+
+    // Explain It Back elements (Requirement B.1)
+    const explainBackSection = document.getElementById('explain-back-section');
+    const finishFeatureBtn = document.getElementById('finish-feature-btn');
+    const explainBackPanel = document.getElementById('explain-back-panel');
+    const closeExplainPanelBtn = document.getElementById('close-explain-panel');
+    const explainBackInput = document.getElementById('explain-back-input');
+    const explainCharCount = document.getElementById('explain-char-count');
+    const submitExplainBtn = document.getElementById('submit-explain-btn');
 
     // Hint ladder elements
     const hintBtns = {
@@ -1152,6 +1649,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     let currentHintLevel = 1;
     let isLoading = false;
+    let hasReplies = false; // Tracks if at least one reply has been received
 
     // Notify extension host that webview is fully loaded and ready to receive messages
     vscode.postMessage({ type: 'ready' });
@@ -1219,6 +1717,73 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     // -------------------------------------------------------------------------
+    // HEADER & EXPLAIN BACK ACTIONS
+    // -------------------------------------------------------------------------
+    // Requirement A.1: "Review my code" header button
+    if (reviewCodeBtn) {
+      reviewCodeBtn.addEventListener('click', function() {
+        if (isLoading) return;
+        vscode.postMessage({ type: 'reviewFile' });
+      });
+    }
+
+    // Requirement B.1: "I finished this feature" button toggles inline panel
+    if (finishFeatureBtn) {
+      finishFeatureBtn.addEventListener('click', function() {
+        finishFeatureBtn.style.display = 'none';
+        explainBackPanel.style.display = 'flex';
+        explainBackInput.focus();
+      });
+    }
+
+    if (closeExplainPanelBtn) {
+      closeExplainPanelBtn.addEventListener('click', function() {
+        explainBackPanel.style.display = 'none';
+        finishFeatureBtn.style.display = 'inline-flex';
+      });
+    }
+
+    // Requirement B.1: Disable submit until text has at least 15 characters
+    if (explainBackInput) {
+      explainBackInput.addEventListener('input', function() {
+        const text = explainBackInput.value.trim();
+        const len = text.length;
+        if (explainCharCount) {
+          explainCharCount.textContent = len + ' / 15 chars min';
+        }
+        if (submitExplainBtn) {
+          submitExplainBtn.disabled = len < 15;
+        }
+      });
+    }
+
+    // Requirement B.2: Submit explanation
+    if (submitExplainBtn) {
+      submitExplainBtn.addEventListener('click', function() {
+        const text = explainBackInput.value.trim();
+        if (text.length < 15 || isLoading) return;
+
+        // Reset and hide panel
+        explainBackPanel.style.display = 'none';
+        finishFeatureBtn.style.display = 'inline-flex';
+        explainBackInput.value = '';
+        submitExplainBtn.disabled = true;
+        if (explainCharCount) {
+          explainCharCount.textContent = '0 / 15 chars min';
+        }
+
+        // Show learner message bubble
+        appendUserMessage('Explaining my understanding:\\n' + text);
+
+        // Send to extension host
+        vscode.postMessage({
+          type: 'explainBack',
+          explanation: text
+        });
+      });
+    }
+
+    // -------------------------------------------------------------------------
     // OUTGOING MESSAGES
     // -------------------------------------------------------------------------
     function sendMessage() {
@@ -1276,14 +1841,21 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       switch (message.type) {
         case 'reply': {
-          // Received structured MentorReply data: { type: 'reply', data: MentorReply, mode: 'task' | 'explain' }
+          // Received structured MentorReply data:
+          // { type: 'reply', data: MentorReply, mode: 'task' | 'explain' | 'review' | 'explain_back' }
           renderMentorReplyCard(message.data, message.mode);
           break;
         }
 
         case 'userMessage': {
-          // Extension emitted a learner message (e.g. "Explaining your selection...")
+          // Extension emitted a learner message (e.g. "Reviewing app.js..." or "Explaining selection...")
           appendUserMessage(message.text);
+          break;
+        }
+
+        case 'noticeMessage': {
+          // Requirement A.3: Friendly in-chat message when no active file or empty
+          appendNoticeMessage(message.text);
           break;
         }
 
@@ -1310,6 +1882,24 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           hideSolutionConfirmation();
           userInput.value = '';
           userInput.style.height = 'auto';
+
+          // Reset "I finished this feature" visibility
+          hasReplies = false;
+          if (explainBackSection) {
+            explainBackSection.style.display = 'none';
+          }
+          if (explainBackPanel) {
+            explainBackPanel.style.display = 'none';
+          }
+          if (finishFeatureBtn) {
+            finishFeatureBtn.style.display = 'inline-flex';
+          }
+          if (explainBackInput) {
+            explainBackInput.value = '';
+          }
+          if (submitExplainBtn) {
+            submitExplainBtn.disabled = true;
+          }
           break;
         }
 
@@ -1353,11 +1943,42 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     /**
+     * Appends a friendly in-chat notice card (e.g. "Open a file with some code first").
+     */
+    function appendNoticeMessage(text) {
+      if (welcomeCard) {
+        welcomeCard.style.display = 'none';
+      }
+
+      const row = document.createElement('div');
+      row.className = 'message-row mentor-row';
+
+      const card = document.createElement('div');
+      card.className = 'notice-card';
+
+      const iconSpan = document.createElement('span');
+      iconSpan.textContent = 'ℹ️';
+      const textSpan = document.createElement('span');
+      textSpan.textContent = text;
+
+      card.appendChild(iconSpan);
+      card.appendChild(textSpan);
+      row.appendChild(card);
+      messagesContainer.appendChild(row);
+      scrollToBottom();
+    }
+
+    /**
      * renderMentorReplyCard:
      * Renders a structured MentorReply response as a card in the chat.
+     * Supports modes:
+     * - 'task': Default ladder card with hint badge and "Need more help?" button
+     * - 'explain': Explain mode with line notes (hides hint badge & need help button)
+     * - 'review': Review mode with findings cards (hides hint badge & need help button)
+     * - 'explain_back': Understanding check card with colored badge, got_right, and gaps (hides hint badge & need help button)
      *
      * @param {Object} reply - Structured MentorReply object
-     * @param {string} mode - 'task' | 'explain'
+     * @param {string} mode - 'task' | 'explain' | 'review' | 'explain_back'
      */
     function renderMentorReplyCard(reply, mode) {
       if (!reply || typeof reply !== 'object') {
@@ -1368,11 +1989,25 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           question: null,
           hint_level: 1,
           code_snippet: null,
-          line_notes: undefined
+          line_notes: undefined,
+          findings: undefined,
+          understanding: undefined,
+          got_right: undefined,
+          gaps: undefined
         };
       }
 
+      // Requirement B.1: Show "I finished this feature" once conversation has at least one reply
+      hasReplies = true;
+      if (explainBackSection) {
+        explainBackSection.style.display = 'block';
+      }
+
       const isExplainMode = (mode === 'explain');
+      const isReviewMode = (mode === 'review');
+      const isExplainBackMode = (mode === 'explain_back');
+      // Hide hint ladder badge and "Need more help?" button for non-task modes
+      const hideLadderControls = isExplainMode || isReviewMode || isExplainBackMode;
 
       const row = document.createElement('div');
       row.className = 'message-row mentor-row';
@@ -1380,22 +2015,35 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       const card = document.createElement('div');
       card.className = 'mentor-card';
 
-      // 1. Header: Mentor label & optional Hint level badge (hidden in explain mode)
+      // 1. Header: Mentor label & optional Hint level badge
       const header = document.createElement('div');
       header.className = 'mentor-card-header';
 
       const titleGroup = document.createElement('div');
       titleGroup.className = 'mentor-title-group';
       const iconSpan = document.createElement('span');
-      iconSpan.textContent = isExplainMode ? '🔍' : '🎓';
       const nameSpan = document.createElement('span');
-      nameSpan.textContent = isExplainMode ? 'Code Mentor (Explain)' : 'Code Mentor';
+
+      if (isExplainMode) {
+        iconSpan.textContent = '🔍';
+        nameSpan.textContent = 'Code Mentor (Explain)';
+      } else if (isReviewMode) {
+        iconSpan.textContent = '📋';
+        nameSpan.textContent = 'Code Mentor (Review)';
+      } else if (isExplainBackMode) {
+        iconSpan.textContent = '🎯';
+        nameSpan.textContent = 'Code Mentor (Check)';
+      } else {
+        iconSpan.textContent = '🎓';
+        nameSpan.textContent = 'Code Mentor';
+      }
+
       titleGroup.appendChild(iconSpan);
       titleGroup.appendChild(nameSpan);
       header.appendChild(titleGroup);
 
-      // In explain mode, do NOT show the Hint level label
-      if (!isExplainMode) {
+      // Only show Hint level label in standard task mode
+      if (!hideLadderControls) {
         const hintBadge = document.createElement('span');
         hintBadge.className = 'hint-badge';
         const level = reply.hint_level || 1;
@@ -1414,7 +2062,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(messageEl);
       }
 
-      // 3. Line notes: list of code fragments with note beside/below it (used in explain mode)
+      // 3. Line notes: list of code fragments with note (used in explain mode)
       if (Array.isArray(reply.line_notes) && reply.line_notes.length > 0) {
         const validNotes = reply.line_notes.filter(function(n) {
           return n && (n.code || n.note);
@@ -1458,7 +2106,145 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      // 4. Guiding question: in italics (if present)
+      // 4. Requirement A.5: Findings list for review mode
+      // Render findings as a list of small cards: area as a bold label, observation as text, the question in italics.
+      if (Array.isArray(reply.findings) && reply.findings.length > 0) {
+        const validFindings = reply.findings.filter(function(f) {
+          return f && (f.area || f.observation || f.question);
+        });
+
+        if (validFindings.length > 0) {
+          const findingsContainer = document.createElement('div');
+          findingsContainer.className = 'findings-container';
+
+          const findingsTitle = document.createElement('div');
+          findingsTitle.className = 'findings-title';
+          findingsTitle.textContent = '📋 Review Findings';
+          findingsContainer.appendChild(findingsTitle);
+
+          const findingsList = document.createElement('div');
+          findingsList.className = 'findings-list';
+
+          validFindings.forEach(function(item) {
+            const itemCard = document.createElement('div');
+            itemCard.className = 'finding-card';
+
+            // Area as bold label
+            if (item.area && item.area.trim()) {
+              const areaEl = document.createElement('div');
+              areaEl.className = 'finding-area';
+              areaEl.textContent = item.area.trim();
+              itemCard.appendChild(areaEl);
+            }
+
+            // Observation as text
+            if (item.observation && item.observation.trim()) {
+              const obsEl = document.createElement('div');
+              obsEl.className = 'finding-observation';
+              obsEl.textContent = item.observation.trim();
+              itemCard.appendChild(obsEl);
+            }
+
+            // Question in italics
+            if (item.question && item.question.trim()) {
+              const qEl = document.createElement('div');
+              qEl.className = 'finding-question';
+              const em = document.createElement('em');
+              em.textContent = item.question.trim();
+              qEl.appendChild(em);
+              itemCard.appendChild(qEl);
+            }
+
+            findingsList.appendChild(itemCard);
+          });
+
+          findingsContainer.appendChild(findingsList);
+          card.appendChild(findingsContainer);
+        }
+      }
+
+      // 5. Requirement B.3: Explain It Back assessment card
+      // Badge for understanding (with text label), "What you got right" list, "What to revisit" list
+      const hasExplainBackData = reply.understanding ||
+        (Array.isArray(reply.got_right) && reply.got_right.length > 0) ||
+        (Array.isArray(reply.gaps) && reply.gaps.length > 0);
+
+      if (hasExplainBackData) {
+        const evalContainer = document.createElement('div');
+        evalContainer.className = 'explain-back-container';
+
+        // Colored badge for understanding (uses VS Code theme variables and explicit text)
+        if (reply.understanding) {
+          const badgeWrap = document.createElement('div');
+          badgeWrap.className = 'understanding-badge-wrapper';
+
+          const badge = document.createElement('span');
+          badge.className = 'understanding-badge badge-' + reply.understanding;
+
+          let label = 'Solid Understanding';
+          let symbol = '●';
+          if (reply.understanding === 'partial') {
+            label = 'Partial Understanding';
+            symbol = '▲';
+          } else if (reply.understanding === 'shaky') {
+            label = 'Needs Work (Shaky)';
+            symbol = '■';
+          }
+          badge.textContent = symbol + ' ' + label;
+          badgeWrap.appendChild(badge);
+          evalContainer.appendChild(badgeWrap);
+        }
+
+        // "What you got right" as a list
+        if (Array.isArray(reply.got_right) && reply.got_right.length > 0) {
+          const rightBox = document.createElement('div');
+          rightBox.className = 'eval-section eval-right';
+
+          const rightTitle = document.createElement('div');
+          rightTitle.className = 'eval-title';
+          rightTitle.textContent = '✓ What you got right:';
+          rightBox.appendChild(rightTitle);
+
+          const rightList = document.createElement('ul');
+          rightList.className = 'eval-list';
+          reply.got_right.forEach(function(item) {
+            if (typeof item === 'string' && item.trim()) {
+              const li = document.createElement('li');
+              li.textContent = item.trim();
+              rightList.appendChild(li);
+            }
+          });
+          rightBox.appendChild(rightList);
+          evalContainer.appendChild(rightBox);
+        }
+
+        // "What to revisit" as a list
+        if (Array.isArray(reply.gaps) && reply.gaps.length > 0) {
+          const gapsBox = document.createElement('div');
+          gapsBox.className = 'eval-section eval-gaps';
+
+          const gapsTitle = document.createElement('div');
+          gapsTitle.className = 'eval-title';
+          gapsTitle.textContent = '⚠️ What to revisit:';
+          gapsBox.appendChild(gapsTitle);
+
+          const gapsList = document.createElement('ul');
+          gapsList.className = 'eval-list';
+          reply.gaps.forEach(function(item) {
+            if (typeof item === 'string' && item.trim()) {
+              const li = document.createElement('li');
+              li.textContent = item.trim();
+              gapsList.appendChild(li);
+            }
+          });
+          gapsBox.appendChild(gapsList);
+          evalContainer.appendChild(gapsBox);
+        }
+
+        card.appendChild(evalContainer);
+      }
+
+      // 6. Guiding question: in italics (if present)
       if (reply.question && reply.question.trim()) {
         const questionBox = document.createElement('div');
         questionBox.className = 'mentor-question-box';
@@ -1470,7 +2256,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(questionBox);
       }
 
-      // 5. "Your next step" box (highlighted)
+      // 7. "Your next step" box (highlighted, if provided)
       if (reply.next_step && reply.next_step.trim()) {
         const nextStepBox = document.createElement('div');
         nextStepBox.className = 'next-step-box';
@@ -1488,7 +2274,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(nextStepBox);
       }
 
-      // 6. Code snippet: in <pre><code> block with Copy button
+      // 8. Code snippet: in <pre><code> block with Copy button
       if (reply.code_snippet && reply.code_snippet.trim()) {
         const snippetText = reply.code_snippet.trim();
 
@@ -1524,7 +2310,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(snippetContainer);
       }
 
-      // 7. Concept chips at bottom
+      // 9. Concept chips at bottom
       if (Array.isArray(reply.concept) && reply.concept.length > 0) {
         const validConcepts = reply.concept.filter(function(c) {
           return typeof c === 'string' && c.trim().length > 0;
@@ -1550,9 +2336,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      // 8. "Need more help?" button
-      // Only shown when NOT in explain mode and when hint level is below 4
-      if (!isExplainMode) {
+      // 10. "Need more help?" button
+      // Only shown when in standard task mode and when hint level is below 4
+      if (!hideLadderControls) {
         const replyLevel = reply.hint_level || currentHintLevel || 1;
         if (replyLevel < 4) {
           const nextLevel = replyLevel + 1;

@@ -40,6 +40,10 @@
       {
         "command": "mentor.explainSelection",
         "title": "Mentor: Explain Selection"
+      },
+      {
+        "command": "mentor.reviewFile",
+        "title": "Mentor: Review My Code"
       }
     ],
     "menus": {

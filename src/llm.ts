@@ -19,6 +19,15 @@ export interface LineNote {
 }
 
 /**
+ * Individual review finding in code review mode.
+ */
+export interface ReviewFinding {
+  area: string;
+  observation: string;
+  question: string;
+}
+
+/**
  * Structured response schema expected from Code Mentor.
  */
 export interface MentorReply {
@@ -29,6 +38,10 @@ export interface MentorReply {
   hint_level: 1 | 2 | 3 | 4;  // 1=nudge 2=hint 3=structure 4=solution
   code_snippet: string | null; // max 5 lines unless hint_level is 4
   line_notes?: LineNote[];    // optional line-by-line notes for explain mode
+  findings?: ReviewFinding[]; // optional findings for review mode
+  understanding?: 'solid' | 'partial' | 'shaky'; // optional rating for explain_back mode
+  got_right?: string[];       // what learner got right in explain_back
+  gaps?: string[];            // topics/concepts to revisit in explain_back
 }
 
 /**
@@ -50,7 +63,7 @@ export class MissingApiKeyError extends Error {
  * 2. Strips Markdown fences (```json ... ``` or ``` ... ```) that the LLM may wrap around the JSON.
  * 3. Attempts to parse the JSON with JSON.parse within a try/catch.
  * 4. If direct parsing fails, attempts to isolate the outermost JSON object between { and }.
- * 5. Sanitizes every field (ensures string types, valid arrays, hint_level bounded to 1..4, line_notes array).
+ * 5. Sanitizes every field (strings, arrays, hint_level bounded to 1..4, line_notes, findings, understanding, got_right, gaps).
  * 6. NEVER throws an exception on bad/malformed JSON; always returns a compliant fallback object.
  *
  * @param raw - The raw text string returned by the Gemini LLM
@@ -65,7 +78,11 @@ export function parseMentorReply(raw: string): MentorReply {
     question: null,
     hint_level: 1,
     code_snippet: null,
-    line_notes: undefined
+    line_notes: undefined,
+    findings: undefined,
+    understanding: undefined,
+    got_right: undefined,
+    gaps: undefined
   };
 
   if (!raw || typeof raw !== 'string') {
@@ -143,7 +160,7 @@ export function parseMentorReply(raw: string): MentorReply {
       ? parsed.code_snippet
       : null;
 
-    // 3g. Line notes (optional array of { code, note } objects)
+    // 3g. Line notes (optional array of { code, note } objects for explain mode)
     let line_notes: LineNote[] | undefined = undefined;
     if (Array.isArray(parsed.line_notes)) {
       const notes: LineNote[] = [];
@@ -165,6 +182,57 @@ export function parseMentorReply(raw: string): MentorReply {
       }
     }
 
+    // 3h. Findings (optional array of { area, observation, question } objects for review mode)
+    let findings: ReviewFinding[] | undefined = undefined;
+    if (Array.isArray(parsed.findings)) {
+      const parsedFindings: ReviewFinding[] = [];
+      for (const item of parsed.findings) {
+        if (item && typeof item === 'object') {
+          const area = typeof item.area === 'string' ? item.area.trim() : '';
+          const observation = typeof item.observation === 'string' ? item.observation.trim() : '';
+          const q = typeof item.question === 'string' ? item.question.trim() : '';
+          if (area || observation || q) {
+            parsedFindings.push({
+              area: area || 'General',
+              observation: observation || '',
+              question: q || ''
+            });
+          }
+        }
+      }
+      if (parsedFindings.length > 0) {
+        findings = parsedFindings;
+      }
+    }
+
+    // 3i. Understanding rating (optional "solid" | "partial" | "shaky" for explain_back mode)
+    let understanding: 'solid' | 'partial' | 'shaky' | undefined = undefined;
+    if (parsed.understanding === 'solid' || parsed.understanding === 'partial' || parsed.understanding === 'shaky') {
+      understanding = parsed.understanding;
+    }
+
+    // 3j. Got right list (optional string array for explain_back mode)
+    let got_right: string[] | undefined = undefined;
+    if (Array.isArray(parsed.got_right)) {
+      const items = parsed.got_right
+        .filter((item: any) => typeof item === 'string' && item.trim().length > 0)
+        .map((item: string) => item.trim());
+      if (items.length > 0) {
+        got_right = items;
+      }
+    }
+
+    // 3k. Gaps to revisit list (optional string array for explain_back mode)
+    let gaps: string[] | undefined = undefined;
+    if (Array.isArray(parsed.gaps)) {
+      const items = parsed.gaps
+        .filter((item: any) => typeof item === 'string' && item.trim().length > 0)
+        .map((item: string) => item.trim());
+      if (items.length > 0) {
+        gaps = items;
+      }
+    }
+
     return {
       message,
       concept,
@@ -172,7 +240,11 @@ export function parseMentorReply(raw: string): MentorReply {
       question,
       hint_level,
       code_snippet,
-      line_notes
+      line_notes,
+      findings,
+      understanding,
+      got_right,
+      gaps
     };
   } catch {
     // If any unexpected error occurs during parsing or sanitization, return fallback
