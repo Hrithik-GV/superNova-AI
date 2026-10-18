@@ -7,12 +7,14 @@ import {
   MentorReply,
   LineNote,
   ReviewFinding,
-  MissingApiKeyError
+  MissingApiKeyError,
+  testApiConnection
 } from './llm';
 import {
   initProgress,
   saveConcepts,
-  getConcepts
+  getConcepts,
+  clearConcepts
 } from './progress';
 import {
   MentorConfig,
@@ -27,23 +29,61 @@ import {
 } from './paste';
 
 /**
+ * Output channel for extension logging.
+ * Clean, secret-free diagnostics.
+ */
+let logChannel: vscode.OutputChannel;
+
+/**
+ * Logs sanitized error messages to the "Code Mentor" output channel.
+ * Never includes API keys, headers, or full request bodies.
+ */
+function logError(message: string, error?: any): void {
+  const timestamp = new Date().toISOString();
+  let detail = '';
+  if (error) {
+    detail = error.message || String(error);
+    // Sanitize any accidental API key patterns (AIza...)
+    detail = detail.replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]');
+  }
+  logChannel.appendLine(`[${timestamp}] ERROR: ${message} ${detail}`.trim());
+}
+
+/**
+ * Checks if a Gemini API key is currently configured in user/workspace settings.
+ */
+function hasApiKeyConfigured(): boolean {
+  const config = vscode.workspace.getConfiguration('mentor');
+  const key = (config.get<string>('apiKey', '') || config.get<string>('apikey', '')).trim();
+  return key.length > 0;
+}
+
+/**
  * Activates the Code Mentor extension.
- * Sets up the WebviewViewProvider for the sidebar chat, loads instructor config,
- * registers paste detection, and registers commands.
+ * Sets up provider, commands, watchers, and listeners.
  */
 export async function activate(context: vscode.ExtensionContext) {
-  // 1. Initialize concept progress tracking module with extension globalState
+  // 1. Create OutputChannel named "Code Mentor" (Requirement E.1)
+  logChannel = vscode.window.createOutputChannel('Code Mentor');
+  context.subscriptions.push(logChannel);
+
+  // 2. Initialize concept tracking module with extension globalState
   initProgress(context.globalState);
 
-  // 2. Load instructor config (.mentor.json) from workspace root
+  // 3. Check onboarding flag in globalState
+  const isOnboarded = context.globalState.get<boolean>('mentor.onboarded', false);
+
+  // 4. Load initial instructor configuration (.mentor.json)
   const initialConfig = await loadConfig();
 
-  // 3. Create and register the WebviewViewProvider for the sidebar chat
+  // 5. Create WebviewViewProvider for the sidebar chat
   const provider = new MentorChatViewProvider(
     context.extensionUri,
     context.globalState,
     initialConfig.config,
-    initialConfig.active
+    initialConfig.active,
+    isOnboarded,
+    hasApiKeyConfigured()
   );
 
   context.subscriptions.push(
@@ -58,13 +98,22 @@ export async function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // 4. Watch for .mentor.json creation, changes, and deletion
+  // 6. Watch for .mentor.json changes
   const configWatcher = watchConfigFile((config, active) => {
     provider.updateConfig(config, active);
   });
   context.subscriptions.push(configWatcher);
 
-  // 5. Register paste detector (authenticates pastes against clipboard, non-modal, non-blocking)
+  // 7. Watch for mentor configuration changes (API key, model)
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('mentor.apiKey') || e.affectsConfiguration('mentor.apikey')) {
+        provider.notifyApiKeyStatus(hasApiKeyConfigured());
+      }
+    })
+  );
+
+  // 8. Register paste detector
   registerPasteDetector(
     context,
     () => provider.getConfigState(),
@@ -73,7 +122,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
-  // 6. Register extension commands
+  // 9. Register extension commands (checked against package.json)
   context.subscriptions.push(
     vscode.commands.registerCommand('mentor.openChat', async () => {
       await vscode.commands.executeCommand('mentor.chat.focus');
@@ -122,10 +171,37 @@ export async function activate(context: vscode.ExtensionContext) {
       await createOrOpenConfigFile();
     })
   );
+
+  // Requirement C.4: "Mentor: Test API Connection" command
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mentor.testConnection', async () => {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Code Mentor: Testing Gemini API connection...'
+        },
+        async () => {
+          const res = await testApiConnection();
+          if (res.success) {
+            vscode.window.showInformationMessage(`Code Mentor: ${res.message}`);
+          } else {
+            vscode.window.showErrorMessage(`Code Mentor: ${res.message}`);
+          }
+        }
+      );
+    })
+  );
+
+  // Requirement E.2: "Mentor: Show Logs" command
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mentor.showLogs', () => {
+      logChannel.show();
+    })
+  );
 }
 
 export function deactivate() {
-  // Cleanup if needed when extension is deactivated
+  // Cleanup managed by subscriptions
 }
 
 /**
@@ -135,20 +211,36 @@ export function deactivate() {
 class MentorChatViewProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
 
-  // In-memory conversation history.
+  // In-memory conversation history
   private _history: ChatMessage[] = [];
 
   // Per-task state retained on the extension host
   private _currentLevel: 1 | 2 | 3 | 4 = 1;
   private _currentTaskText: string = '';
-  // Tracks active interaction mode: 'task', 'explain', 'review', 'explain_back', 'paste_check'
   private _currentMode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' = 'task';
 
   // Active instructor configuration state
   private _currentConfig: MentorConfig;
   private _activeConfig: boolean;
 
-  // Webview lifecycle readiness and queued pending requests for when sidebar is closed
+  // Onboarding & API key status
+  private _isOnboarded: boolean;
+  private _hasApiKey: boolean;
+
+  // Request in-flight tracking & abort controller for cancel/timeout
+  private _isRequestInProgress: boolean = false;
+  private _currentAbortController: AbortController | null = null;
+  private _isUserCancelled: boolean = false;
+  private _isTimeout: boolean = false;
+
+  // Last request cache for seamless Retry (Requirement C.2)
+  private _lastRequest: {
+    content: string;
+    mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check';
+    hintLevel: number;
+  } | null = null;
+
+  // Webview lifecycle readiness and queued pending requests
   private _isWebviewReady: boolean = false;
   private _pendingExplain: { fileName: string; languageId: string; code: string } | null = null;
   private _pendingReview: { fileName: string; languageId: string; code: string } | null = null;
@@ -159,20 +251,20 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     private readonly _extensionUri: vscode.Uri,
     private readonly _globalState: vscode.Memento,
     initialConfig: MentorConfig,
-    initialActive: boolean
+    initialActive: boolean,
+    initialOnboarded: boolean,
+    initialHasApiKey: boolean
   ) {
     this._currentConfig = initialConfig;
     this._activeConfig = initialActive;
+    this._isOnboarded = initialOnboarded;
+    this._hasApiKey = initialHasApiKey;
   }
 
-  /**
-   * Updates configuration dynamically when .mentor.json is modified or deleted.
-   */
   public updateConfig(config: MentorConfig, active: boolean): void {
     this._currentConfig = config;
     this._activeConfig = active;
 
-    // Send updated config state to webview
     this._postMessageToWebview({
       type: 'config',
       config: this._currentConfig,
@@ -180,9 +272,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /**
-   * Returns current config state for paste detector.
-   */
+  public notifyApiKeyStatus(hasKey: boolean): void {
+    this._hasApiKey = hasKey;
+    this._postMessageToWebview({
+      type: 'apiKeyStatus',
+      hasApiKey: this._hasApiKey
+    });
+  }
+
   public getConfigState(): { config: MentorConfig; active: boolean } {
     return {
       config: this._currentConfig,
@@ -213,11 +310,19 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         case 'ready': {
           this._isWebviewReady = true;
 
-          // Deliver initial config and active status to webview
+          // Deliver initial state to webview
           this._postMessageToWebview({
             type: 'config',
             config: this._currentConfig,
             active: this._activeConfig
+          });
+          this._postMessageToWebview({
+            type: 'apiKeyStatus',
+            hasApiKey: this._hasApiKey
+          });
+          this._postMessageToWebview({
+            type: 'onboardedStatus',
+            isOnboarded: this._isOnboarded
           });
 
           // Dispatch any actions queued while sidebar was closed
@@ -245,27 +350,44 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         case 'ask': {
+          // Requirement B.4: Prevent double-sends while request in flight
+          if (this._isRequestInProgress) {
+            return;
+          }
+          await this._markOnboarded();
           await this._handleUserAsk(message.text, message.hintLevel);
           break;
         }
 
         case 'needMoreHelp': {
+          if (this._isRequestInProgress) {
+            return;
+          }
           await this._handleNeedMoreHelp(message.hintLevel);
           break;
         }
 
         case 'reviewFile': {
+          if (this._isRequestInProgress) {
+            return;
+          }
+          await this._markOnboarded();
           await this.reviewActiveFile();
           break;
         }
 
         case 'explainBack': {
+          if (this._isRequestInProgress) {
+            return;
+          }
           await this._handleExplainBack(message.explanation);
           break;
         }
 
         case 'submitPasteCheck': {
-          // Learner submitted explanation for pasted code
+          if (this._isRequestInProgress) {
+            return;
+          }
           await this._handlePasteCheck(
             message.fileName,
             message.languageId,
@@ -275,12 +397,57 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           break;
         }
 
+        case 'cancelRequest': {
+          // Requirement B.2: Cancel button / Escape pressed during loading
+          if (this._currentAbortController && this._isRequestInProgress) {
+            this._isUserCancelled = true;
+            this._currentAbortController.abort();
+          }
+          break;
+        }
+
+        case 'retryLast': {
+          // Requirement C.2: Retry resends exactly the last request
+          if (this._isRequestInProgress || !this._lastRequest) {
+            return;
+          }
+          await this._executePrompt(
+            this._lastRequest.content,
+            this._lastRequest.mode,
+            this._lastRequest.hintLevel,
+            true // isRetry
+          );
+          break;
+        }
+
+        case 'getConcepts': {
+          // Requirement F.1: Fetch concepts for Progress Panel
+          const concepts = getConcepts(this._globalState);
+          this._postMessageToWebview({
+            type: 'conceptsData',
+            concepts
+          });
+          break;
+        }
+
+        case 'resetConcepts': {
+          // Requirement F.2: Reset concepts
+          await clearConcepts(this._globalState);
+          this._postMessageToWebview({
+            type: 'conceptsData',
+            concepts: {}
+          });
+          break;
+        }
+
         case 'newTask':
         case 'clearHistory': {
+          // Clears conversation history, resets level to 1, and clears chat UI
           this._history = [];
           this._currentLevel = 1;
           this._currentTaskText = '';
           this._currentMode = 'task';
+          this._lastRequest = null;
           this._postMessageToWebview({
             type: 'taskReset'
           });
@@ -299,22 +466,35 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Handles paste event triggered by paste detector:
-   * - "explain_to_me": Uses Explain Selection pipeline with pasted text
-   * - "explain_it": Prompts learner with inline panel in chat
+   * Marks the learner as onboarded once their first question or action is sent.
    */
+  private async _markOnboarded(): Promise<void> {
+    if (!this._isOnboarded) {
+      this._isOnboarded = true;
+      try {
+        await this._globalState.update('mentor.onboarded', true);
+      } catch (err) {
+        logError('Failed to persist onboarded state to globalState', err);
+      }
+      this._postMessageToWebview({
+        type: 'onboardedStatus',
+        isOnboarded: true
+      });
+    }
+  }
+
   public async handlePasteEvent(payload: PasteEventPayload): Promise<void> {
     await vscode.commands.executeCommand('mentor.chat.focus');
 
     if (payload.action === 'explain_to_me') {
-      // Reuse Explain Selection pipeline
+      await this._markOnboarded();
       this._postMessageToWebview({
         type: 'userMessage',
         text: 'Explaining the pasted code...'
       });
 
       const prompt = `Mode: explain\nFile: ${payload.fileName} (${payload.languageId})\nSelected code:\n${payload.pastedCode}`;
-      await this._executePrompt(prompt, 'explain');
+      await this._executePrompt(prompt, 'explain', 1);
     } else if (payload.action === 'explain_it') {
       if (!this._view || !this._isWebviewReady) {
         this._pendingPasteExplain = payload;
@@ -324,12 +504,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /**
-   * Prompts the learner in webview to explain the pasted code in their own words.
-   * Pasted code remains in memory only.
-   */
   private async _promptPasteCheckInWebview(payload: PasteEventPayload): Promise<void> {
-    // Truncate code display at 120 lines for readability
     const lines = payload.pastedCode.split(/\r?\n/);
     let displayCode = payload.pastedCode;
     let isTruncated = false;
@@ -349,9 +524,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /**
-   * Handles submission of learner's explanation of pasted code.
-   */
   private async _handlePasteCheck(
     fileName: string,
     languageId: string,
@@ -359,20 +531,17 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     explanation: string
   ): Promise<void> {
     this._currentMode = 'paste_check';
+    await this._markOnboarded();
 
-    // Show learner-side message
     this._postMessageToWebview({
       type: 'userMessage',
       text: 'Checking my understanding of the pasted code...'
     });
 
     const prompt = `Mode: paste_check\nFile: ${fileName} (${languageId})\nPasted code:\n${code}\nLearner's explanation:\n${explanation}`;
-    await this._executePrompt(prompt, 'paste_check');
+    await this._executePrompt(prompt, 'paste_check', 1);
   }
 
-  /**
-   * Entry point for the "Mentor: Explain Selection" command.
-   */
   public async explainSelection(fileName: string, languageId: string, selectedText: string): Promise<void> {
     const lines = selectedText.split(/\r?\n/);
     let code = selectedText;
@@ -390,6 +559,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
   private async _executeExplain(fileName: string, languageId: string, code: string): Promise<void> {
     this._currentMode = 'explain';
+    await this._markOnboarded();
 
     this._postMessageToWebview({
       type: 'userMessage',
@@ -397,7 +567,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     const prompt = `Mode: explain\nFile: ${fileName} (${languageId})\nSelected code:\n${code}`;
-    await this._executePrompt(prompt, 'explain');
+    await this._executePrompt(prompt, 'explain', 1);
   }
 
   public async reviewActiveFile(editor?: vscode.TextEditor): Promise<void> {
@@ -448,6 +618,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   private async _executeReview(fileName: string, languageId: string, code: string): Promise<void> {
     this._currentMode = 'review';
     this._currentTaskText = `Review ${fileName}`;
+    await this._markOnboarded();
 
     this._postMessageToWebview({
       type: 'userMessage',
@@ -455,7 +626,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     const prompt = `Mode: review\nFile: ${fileName} (${languageId})\nCurrent file:\n${code}`;
-    await this._executePrompt(prompt, 'review');
+    await this._executePrompt(prompt, 'review', 1);
   }
 
   private async _handleExplainBack(learnerExplanation: string): Promise<void> {
@@ -466,6 +637,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     this._currentMode = 'explain_back';
     const task = this._currentTaskText || 'Current coding task';
+    await this._markOnboarded();
 
     const targetEditor = vscode.window.activeTextEditor || vscode.window.visibleTextEditors[0];
     let fileSection = '';
@@ -485,13 +657,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     const prompt = `Mode: explain_back\nTask: ${task}${fileSection}\nLearner's explanation:\n${trimmedExplanation}`;
-    await this._executePrompt(prompt, 'explain_back');
+    await this._executePrompt(prompt, 'explain_back', 1);
   }
 
-  /**
-   * Processes a learner question from the chat input.
-   * Clamps requested hint level to config.maxHintLevel on the extension host.
-   */
   private async _handleUserAsk(userText: string, hintLevel?: number) {
     const trimmedText = userText ? userText.trim() : '';
     if (!trimmedText) {
@@ -503,12 +671,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       ? hintLevel
       : 1;
 
-    // =========================================================================
     // CONFIG HINT LEVEL CLAMPING (Requirement A.5)
-    // =========================================================================
-    // Enforce instructor's maxHintLevel: clamp the level requested by the learner
-    // so they cannot bypass restrictions via direct postMessage or UI manipulation.
-    // Also format user message as "Requested hint level: N (course maximum: M)".
     const effectiveMax = this._currentConfig.maxHintLevel;
     const clampedLevel = Math.min(requestedLevel, effectiveMax) as 1 | 2 | 3 | 4;
     this._currentLevel = clampedLevel;
@@ -526,12 +689,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       userMessageContent = `${contextBlock}\n\nLearner Question:\n${trimmedText}\n\n${hintLevelLabel}`;
     }
 
-    await this._executePrompt(userMessageContent, 'task');
+    await this._executePrompt(userMessageContent, 'task', clampedLevel);
   }
 
-  /**
-   * Handles "Need more help?" with instructor config clamping.
-   */
   private async _handleNeedMoreHelp(hintLevel?: number) {
     const taskText = this._currentTaskText.trim();
     if (!taskText) {
@@ -543,9 +703,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       ? hintLevel
       : Math.min(effectiveMax, this._currentLevel + 1);
 
-    // =========================================================================
-    // CONFIG HINT LEVEL CLAMPING (Requirement A.5)
-    // =========================================================================
     const clampedLevel = Math.min(requestedLevel, effectiveMax) as 1 | 2 | 3 | 4;
     this._currentLevel = clampedLevel;
     this._currentMode = 'task';
@@ -562,25 +719,65 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       userMessageContent = `${contextBlock}\n\nLearner Question:\n${taskText}\n\n${hintLevelLabel}`;
     }
 
-    await this._executePrompt(userMessageContent, 'task');
+    await this._executePrompt(userMessageContent, 'task', clampedLevel);
   }
 
   /**
-   * Shared prompt executor.
-   * Passes dynamic instructor config and active status to askMentor.
+   * ===========================================================================
+   * SHARED PROMPT EXECUTOR: ABORT, TIMEOUT, AND ERROR MAPPING (Requirements B & C)
+   * ===========================================================================
+   * - Uses AbortController to support immediate user cancellation (Escape / Cancel button).
+   * - Sets a 30-second timeout that aborts the fetch and shows a friendly retryable error.
+   * - Prevents duplicate requests while in flight.
+   * - Maps all error codes to friendly strings without raw traces or leaked credentials.
+   * - Retains last request payload to enable zero-retype retry.
    */
   private async _executePrompt(
     userMessageContent: string,
-    mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check'
+    mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check',
+    hintLevel: number,
+    isRetry: boolean = false
   ): Promise<void> {
     if (!this._view) {
       return;
     }
 
-    this._history.push({
-      role: 'user',
-      content: userMessageContent
-    });
+    // Cache the request parameters for seamless Retry (Requirement C.2)
+    this._lastRequest = {
+      content: userMessageContent,
+      mode: mode,
+      hintLevel: hintLevel
+    };
+
+    // Prevent double-sends (Requirement B.4)
+    this._isRequestInProgress = true;
+    this._isUserCancelled = false;
+    this._isTimeout = false;
+
+    // AbortController setup (Requirement B.2)
+    this._currentAbortController = new AbortController();
+
+    // 30 second timeout timer (Requirement B.3)
+    const timeoutTimer = setTimeout(() => {
+      this._isTimeout = true;
+      this._currentAbortController?.abort();
+    }, 30000);
+
+    // If this is a retry, show a subtle retry notice in the chat
+    if (isRetry) {
+      this._postMessageToWebview({
+        type: 'userMessage',
+        text: 'Retrying last request...'
+      });
+    }
+
+    // Push into history only if not retrying an already pushed user message
+    if (!isRetry) {
+      this._history.push({
+        role: 'user',
+        content: userMessageContent
+      });
+    }
 
     this._postMessageToWebview({
       type: 'loading',
@@ -588,8 +785,17 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     try {
-      // Pass active instructor configuration to askMentor
-      const rawReply = await askMentor(this._history, this._currentConfig, this._activeConfig);
+      const rawReply = await askMentor(
+        this._history,
+        this._currentConfig,
+        this._activeConfig,
+        this._currentAbortController.signal
+      );
+
+      // Check for empty or unusable reply (Requirement C.1)
+      if (!rawReply || rawReply.trim().length === 0) {
+        throw new Error('EMPTY_RESPONSE');
+      }
 
       this._history.push({
         role: 'assistant',
@@ -598,7 +804,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       const structuredReply: MentorReply = parseMentorReply(rawReply);
 
-      // Persist identified concepts to globalState
+      // Persist learned concepts in globalState
       if (Array.isArray(structuredReply.concept) && structuredReply.concept.length > 0) {
         await saveConcepts(structuredReply.concept, this._globalState);
       }
@@ -609,47 +815,118 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         mode: mode
       });
     } catch (error: any) {
-      let errorMessage = 'An unexpected error occurred while communicating with Code Mentor.';
-      let isApiKeyError = false;
+      clearTimeout(timeoutTimer);
 
-      if (error instanceof MissingApiKeyError) {
-        isApiKeyError = true;
-        errorMessage = error.message;
-      } else if (
-        error?.status === 400 ||
-        error?.status === 401 ||
-        error?.status === 403 ||
-        error?.message?.includes('API_KEY_INVALID') ||
-        error?.message?.includes('API key not valid') ||
-        error?.message?.includes('apiKey')
-      ) {
-        isApiKeyError = true;
-        errorMessage = 'Invalid Google Gemini API Key. Please check your key in settings.';
-      } else if (
-        error?.status === 429 ||
-        error?.message?.includes('429') ||
-        error?.message?.includes('RESOURCE_EXHAUSTED') ||
-        error?.message?.includes('quota')
-      ) {
-        errorMessage = 'Gemini API rate limit exceeded (429). Please wait a moment before trying again.';
-      } else if (
-        error?.code === 'ENOTFOUND' ||
-        error?.message?.includes('fetch failed') ||
-        error?.name === 'APIConnectionError'
-      ) {
-        errorMessage = 'Network connection failed. Please check your internet connection and try again.';
-      } else if (error?.message) {
-        errorMessage = `Gemini API error: ${error.message}`;
+      // Requirement B.2: User cancellation handling
+      if (this._isUserCancelled) {
+        logError('Request was cancelled by learner');
+        // Remove the unanswered turn so user can proceed cleanly
+        if (!isRetry) {
+          this._history.pop();
+        }
+        this._postMessageToWebview({
+          type: 'requestCancelled'
+        });
+        return;
       }
 
-      this._history.pop();
+      // =======================================================================
+      // FRIENDLY ERROR MAPPING (Requirement C.1)
+      // Never expose raw stack traces, API keys, or full request payloads.
+      // =======================================================================
+      let errorMessage = 'An unexpected error occurred. Please try again.';
+      let errorAction: 'openSettings' | 'retry' | 'none' = 'none';
+      let actionLabel = '';
+      let retryCountdown = 0;
+
+      const status = error?.status;
+      const msg = error?.message || '';
+
+      if (error instanceof MissingApiKeyError) {
+        errorMessage = 'Add your API key to get started.';
+        errorAction = 'openSettings';
+        actionLabel = 'Set API key';
+      } else if (
+        status === 400 ||
+        status === 401 ||
+        status === 403 ||
+        msg.includes('API_KEY_INVALID') ||
+        msg.includes('API key not valid')
+      ) {
+        errorMessage = 'Your API key was rejected. Check that it is correct and has access to the model.';
+        errorAction = 'openSettings';
+        actionLabel = 'Open settings';
+      } else if (
+        status === 404 ||
+        msg.includes('models/') ||
+        (msg.includes('not found') && !msg.includes('API'))
+      ) {
+        errorMessage = 'The model name in settings was not found.';
+        errorAction = 'openSettings';
+        actionLabel = 'Open settings';
+      } else if (
+        status === 429 ||
+        msg.includes('429') ||
+        msg.includes('RESOURCE_EXHAUSTED') ||
+        msg.includes('quota')
+      ) {
+        errorMessage = "You're sending requests too fast or hit the free limit. Wait a minute and try again.";
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+        retryCountdown = 20; // 20s disabled countdown
+      } else if (
+        (status >= 500 && status < 600) ||
+        msg.includes('500') ||
+        msg.includes('503') ||
+        msg.includes('Internal Server Error')
+      ) {
+        errorMessage = 'The AI service had a problem. Try again in a moment.';
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+      } else if (this._isTimeout || msg.includes('timeout') || msg.includes('timed out')) {
+        errorMessage = 'That took too long.';
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+      } else if (
+        error?.code === 'ENOTFOUND' ||
+        error?.code === 'ECONNREFUSED' ||
+        msg.includes('fetch failed') ||
+        error?.name === 'APIConnectionError'
+      ) {
+        errorMessage = "Can't reach the AI service. Check your internet connection.";
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+      } else if (msg === 'EMPTY_RESPONSE') {
+        errorMessage = "I didn't get a useful answer.";
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+      } else {
+        errorMessage = 'The AI service had a problem. Try again in a moment.';
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+      }
+
+      logError(`API call failed: ${errorMessage}`);
+
+      // Remove last unanswered turn so chat history remains uncorrupted
+      if (!isRetry && this._history.length > 0) {
+        this._history.pop();
+      }
 
       this._postMessageToWebview({
-        type: 'error',
+        type: 'friendlyError',
         message: errorMessage,
-        isApiKeyError: isApiKeyError
+        action: errorAction,
+        actionLabel: actionLabel,
+        countdown: retryCountdown
       });
     } finally {
+      clearTimeout(timeoutTimer);
+      this._isRequestInProgress = false;
+      this._currentAbortController = null;
+      this._isTimeout = false;
+      this._isUserCancelled = false;
+
       this._postMessageToWebview({
         type: 'loading',
         loading: false
@@ -732,6 +1009,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       overflow: hidden;
     }
 
+    /* Accessibility focus outlines */
+    button:focus-visible,
+    textarea:focus-visible,
+    summary:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 1px;
+    }
+
     /* Header Bar */
     .chat-header {
       display: flex;
@@ -764,7 +1049,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     .header-actions {
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 4px;
+      flex-wrap: wrap;
     }
 
     .header-actions button {
@@ -774,7 +1060,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       cursor: pointer;
       font-size: 11px;
       font-weight: 500;
-      padding: 3px 8px;
+      padding: 3px 7px;
       border-radius: 3px;
       font-family: inherit;
       transition: background 0.15s ease;
@@ -785,9 +1071,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25));
     }
 
-    /* Requirement A.6: Course settings active badge */
     .course-badge-row {
-      display: none; /* hidden until active config arrives */
+      display: none;
     }
 
     .course-badge {
@@ -818,35 +1103,110 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       gap: 14px;
     }
 
-    /* Empty / Welcome Card */
+    /* =============================================================
+       ONBOARDING / WELCOME CARD (Requirement A)
+       ============================================================= */
     .welcome-card {
       background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
       border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.2));
       border-radius: 6px;
-      padding: 14px;
+      padding: 12px 14px;
       line-height: 1.5;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
     }
 
     .welcome-card h3 {
       font-size: 13px;
       font-weight: 600;
-      margin-bottom: 6px;
       color: var(--vscode-textLink-foreground, inherit);
     }
 
-    .welcome-card p {
+    .welcome-tagline {
       font-size: 12px;
-      opacity: 0.9;
-      margin-bottom: 8px;
+      opacity: 0.95;
+      line-height: 1.45;
     }
 
-    .welcome-tips {
-      font-size: 11px;
-      padding-left: 14px;
-      opacity: 0.8;
+    .welcome-bullets {
+      font-size: 11.5px;
+      padding-left: 16px;
       display: flex;
       flex-direction: column;
       gap: 4px;
+      opacity: 0.9;
+    }
+
+    .example-chips-container {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .example-chips-label {
+      font-size: 10.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      opacity: 0.75;
+    }
+
+    .example-chips-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .prompt-chip {
+      background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.15));
+      color: var(--vscode-textLink-foreground, var(--vscode-button-secondaryForeground));
+      border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.25));
+      border-radius: 12px;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      font-family: inherit;
+      text-align: left;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .prompt-chip:hover {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25));
+      border-color: var(--vscode-focusBorder);
+    }
+
+    .welcome-privacy {
+      font-size: 10.5px;
+      opacity: 0.65;
+      line-height: 1.35;
+      border-top: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.15));
+      padding-top: 6px;
+    }
+
+    /* Setup Box when no API Key is set */
+    .setup-box {
+      background: var(--vscode-inputValidation-warningBackground, rgba(255, 165, 0, 0.12));
+      border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(255, 165, 0, 0.4));
+      border-left: 3px solid var(--vscode-editorWarning-foreground, #cca700);
+      border-radius: 4px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .setup-box-title {
+      font-weight: 600;
+      font-size: 12px;
+      color: var(--vscode-foreground);
+    }
+
+    .setup-box-hint {
+      font-size: 11.5px;
+      opacity: 0.9;
+      line-height: 1.4;
     }
 
     /* Base Message Rows */
@@ -871,6 +1231,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       line-height: 1.45;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+
+    .cancelled-note {
+      font-size: 11px;
+      font-style: italic;
+      opacity: 0.7;
+      margin-top: 3px;
+      align-self: flex-end;
     }
 
     .notice-card {
@@ -898,7 +1266,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       border-radius: 6px;
       padding: 12px 14px;
       width: 100%;
-      max-width: 98%;
+      max-width: 100%;
       box-shadow: 0 1px 4px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.08));
       display: flex;
       flex-direction: column;
@@ -911,6 +1279,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       justify-content: space-between;
       padding-bottom: 6px;
       border-bottom: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.15));
+      flex-wrap: wrap;
+      gap: 4px;
     }
 
     .mentor-title-group {
@@ -1159,7 +1529,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       line-height: 1.45;
     }
 
-    /* Paste Check Inline Prompt Card (Requirement B.6) */
+    /* Paste Check Panel */
     .paste-check-panel {
       background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.1));
       border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
@@ -1220,10 +1590,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       line-height: 1.4;
     }
 
-    textarea#paste-explain-input:focus {
-      border-color: var(--vscode-focusBorder);
-    }
-
     .paste-check-footer {
       display: flex;
       justify-content: space-between;
@@ -1268,11 +1634,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     .copy-code-btn:hover {
       background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.3));
-    }
-
-    .copy-code-btn.copied {
-      background: var(--vscode-badge-background, rgba(128, 128, 128, 0.4));
-      color: var(--vscode-badge-foreground, inherit);
     }
 
     .code-snippet-container pre {
@@ -1347,18 +1708,25 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       cursor: not-allowed;
     }
 
-    /* Error Card */
+    /* Friendly Error Card with Retry Button (Requirement C) */
     .error-card {
       background: var(--vscode-inputValidation-errorBackground, rgba(255, 0, 0, 0.1));
       border: 1px solid var(--vscode-inputValidation-errorBorder, rgba(255, 0, 0, 0.4));
-      color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground, #ff6b6b));
+      border-left: 3px solid var(--vscode-errorForeground, #ff6b6b);
+      color: var(--vscode-foreground);
       border-radius: 6px;
       padding: 10px 12px;
       font-size: 12px;
-      line-height: 1.4;
+      line-height: 1.45;
       display: flex;
       flex-direction: column;
       gap: 8px;
+    }
+
+    .error-card-text {
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
 
     .btn-action {
@@ -1366,7 +1734,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
       border: none;
-      padding: 6px 12px;
+      padding: 5px 12px;
       font-size: 11px;
       font-weight: 500;
       border-radius: 3px;
@@ -1374,22 +1742,37 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       font-family: inherit;
     }
 
-    .btn-action:hover {
+    .btn-action:hover:not(:disabled) {
       background: var(--vscode-button-hoverBackground);
     }
 
-    /* Loading Indicator */
-    .loading-indicator {
+    .btn-action:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Loading & Cancel Section (Requirement B) */
+    .loading-row {
       display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 8px;
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.2));
+      border-radius: 4px;
+    }
+
+    .loading-row.visible {
+      display: flex;
+    }
+
+    .loading-text-group {
+      display: flex;
       align-items: center;
       gap: 6px;
       font-size: 11.5px;
-      opacity: 0.8;
-      padding: 4px 6px;
-    }
-
-    .loading-indicator.visible {
-      display: flex;
+      opacity: 0.9;
     }
 
     .dots-pulse {
@@ -1413,6 +1796,33 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       40% { transform: scale(1); opacity: 1; }
     }
 
+    .cancel-btn {
+      background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.2));
+      color: var(--vscode-button-secondaryForeground, inherit);
+      border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.2));
+      border-radius: 3px;
+      padding: 3px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .cancel-btn:hover {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.3));
+    }
+
+    /* Reduced Motion (Requirement B.5) */
+    @media (prefers-reduced-motion: reduce) {
+      .dots-pulse span {
+        animation: none !important;
+        opacity: 0.8 !important;
+        transform: none !important;
+      }
+      .mentor-card, .solution-confirm-banner, .paste-check-panel, .explain-back-panel {
+        animation: none !important;
+      }
+    }
+
     /* Chat Footer */
     .chat-footer {
       padding: 8px 12px 10px 12px;
@@ -1423,7 +1833,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       gap: 8px;
     }
 
-    /* Explain It Back Inline Panel */
     .explain-back-section {
       display: flex;
       flex-direction: column;
@@ -1503,10 +1912,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       line-height: 1.4;
     }
 
-    textarea#explain-back-input:focus {
-      border-color: var(--vscode-focusBorder);
-    }
-
     .explain-back-panel-footer {
       display: flex;
       justify-content: space-between;
@@ -1546,7 +1951,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       gap: 6px;
     }
 
-    /* Soft confirmation banner */
     .solution-confirm-banner {
       background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.12));
       border: 1px solid var(--vscode-focusBorder, rgba(0, 122, 204, 0.5));
@@ -1634,7 +2038,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       font-weight: 600;
     }
 
-    /* Requirement A.6: Disabled buttons above instructor maxHintLevel */
     .hint-btn:disabled,
     .hint-btn.disabled-by-course {
       opacity: 0.45;
@@ -1711,6 +2114,98 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       opacity: 0.5;
       cursor: not-allowed;
     }
+
+    /* Progress Panel (Requirement F) */
+    .progress-panel {
+      display: none;
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
+      border-radius: 6px;
+      padding: 12px;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .progress-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .progress-title {
+      font-weight: 600;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .progress-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    .progress-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 5px 8px;
+      border-radius: 3px;
+      background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.06));
+      font-size: 11.5px;
+    }
+
+    .progress-item-name {
+      font-weight: 500;
+    }
+
+    .progress-item-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      opacity: 0.75;
+      font-size: 10.5px;
+    }
+
+    .progress-empty-msg {
+      font-style: italic;
+      font-size: 11.5px;
+      opacity: 0.75;
+      padding: 6px 0;
+    }
+
+    .progress-footer {
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 8px;
+      border-top: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.15));
+      padding-top: 6px;
+    }
+
+    .btn-reset-progress {
+      background: transparent;
+      border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.2));
+      color: var(--vscode-foreground);
+      font-size: 10.5px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+
+    .btn-reset-progress:hover {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.2));
+    }
+
+    .reset-confirm-box {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+    }
   </style>
 </head>
 <body>
@@ -1722,11 +2217,11 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         <span>Code Mentor</span>
       </div>
       <div class="header-actions">
-        <button id="review-code-btn" title="Review my current active file">🔍 Review my code</button>
-        <button id="new-task-btn" title="Clear conversation history and reset level to 1">+ New task</button>
+        <button id="progress-toggle-btn" title="View your learned concepts" aria-label="View learning progress">📊 Progress</button>
+        <button id="review-code-btn" title="Review my current active file" aria-label="Review active file">🔍 Review</button>
+        <button id="new-task-btn" title="Clear conversation history and reset level to 1" aria-label="Start new task">+ New task</button>
       </div>
     </div>
-    <!-- Requirement A.6: Course settings active badge -->
     <div class="course-badge-row" id="course-badge-row">
       <span class="course-badge" id="course-badge" title="Course configuration active">
         📚 Course settings active · max hint: <span id="course-max-hint-name">Solution</span>
@@ -1734,28 +2229,70 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </div>
 
-  <!-- Chat Messages Container -->
-  <div class="messages-container" id="messages-container">
-    <div class="welcome-card" id="welcome-card">
-      <h3>👋 Welcome to Code Mentor!</h3>
-      <p>I'm here to teach you how to code, explain concepts step-by-step, and guide you without writing all the code for you.</p>
-      <div class="welcome-tips">
-        <div>• Choose your hint ladder level: Nudge (1), Hint (2), Structure (3), or Solution (4)</div>
-        <div>• Click <b>🔍 Review my code</b> to get an educational review of your current file</div>
-        <div>• Right-click any selected code and choose <b>Mentor: Explain Selection</b></div>
-        <div>• Click <b>✓ I finished this feature</b> to explain it in your own words</div>
+  <!-- Messages Container (Requirement D.3: role="log" and aria-live="polite") -->
+  <div class="messages-container" id="messages-container" role="log" aria-live="polite">
+
+    <!-- Progress Panel Card (Requirement F) -->
+    <div class="progress-panel" id="progress-panel">
+      <div class="progress-header">
+        <span class="progress-title">📊 Concepts Progress</span>
+        <button type="button" class="btn-close-panel" id="close-progress-btn" aria-label="Close progress panel">✕</button>
+      </div>
+      <div class="progress-list" id="progress-list">
+        <!-- Rendered dynamically -->
+      </div>
+      <div class="progress-footer">
+        <div class="reset-confirm-box" id="reset-confirm-box">
+          <span>Clear all?</span>
+          <button type="button" class="btn-action" id="confirm-reset-progress-btn">Yes, reset</button>
+          <button type="button" class="cancel-btn" id="cancel-reset-progress-btn">Cancel</button>
+        </div>
+        <button type="button" class="btn-reset-progress" id="init-reset-progress-btn">Reset progress</button>
       </div>
     </div>
+
+    <!-- Onboarding / Welcome Card (Requirement A) -->
+    <div class="welcome-card" id="welcome-card">
+      <div id="welcome-normal-content">
+        <h3>👋 Welcome to Code Mentor!</h3>
+        <p class="welcome-tagline">I help you learn by guiding you, not by writing everything for you.</p>
+        <ul class="welcome-bullets" id="welcome-bullets">
+          <li>Ask for a plan when starting a task</li>
+          <li>Use the hint buttons when you're stuck</li>
+          <li>Right-click selected code to have it explained</li>
+        </ul>
+        <div class="example-chips-container">
+          <span class="example-chips-label">Try asking:</span>
+          <div class="example-chips-list">
+            <button type="button" class="prompt-chip" data-prompt="Build a responsive navbar">Build a responsive navbar</button>
+            <button type="button" class="prompt-chip" data-prompt="Make a card with an image and title">Make a card with an image and title</button>
+            <button type="button" class="prompt-chip" data-prompt="Explain the code I selected">Explain the code I selected</button>
+          </div>
+        </div>
+        <div class="welcome-privacy">Your current file and selected code are sent to your AI provider to generate replies.</div>
+      </div>
+
+      <!-- Setup Box when no API Key is set (Requirement A.2) -->
+      <div class="setup-box" id="welcome-setup-box" style="display: none;">
+        <div class="setup-box-title">🔑 Set Up Your Gemini API Key</div>
+        <div class="setup-box-hint">Get a free API key at Google AI Studio (<a href="https://aistudio.google.com" style="color: inherit;">aistudio.google.com</a>) to begin chatting with your mentor.</div>
+        <button type="button" class="btn-action" id="welcome-set-key-btn">Set API key</button>
+      </div>
+    </div>
+
   </div>
 
-  <!-- Loading State -->
-  <div class="loading-indicator" id="loading-indicator">
-    <div class="dots-pulse">
-      <span></span>
-      <span></span>
-      <span></span>
+  <!-- Loading & Cancel Indicator (Requirement B.1 & B.2) -->
+  <div class="loading-row" id="loading-row">
+    <div class="loading-text-group">
+      <div class="dots-pulse" aria-hidden="true">
+        <span></span>
+        <span></span>
+        <span></span>
+      </div>
+      <span>Mentor is thinking...</span>
     </div>
-    <span>Mentor is thinking...</span>
+    <button type="button" class="cancel-btn" id="cancel-request-btn" aria-label="Cancel thinking request">Cancel (Esc)</button>
   </div>
 
   <!-- Chat Footer -->
@@ -1768,7 +2305,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       <div class="explain-back-panel" id="explain-back-panel" style="display: none;">
         <div class="explain-back-panel-header">
           <span>Explain in your own words how this works</span>
-          <button type="button" class="btn-close-panel" id="close-explain-panel" title="Close panel">✕</button>
+          <button type="button" class="btn-close-panel" id="close-explain-panel" aria-label="Close panel">✕</button>
         </div>
         <textarea id="explain-back-input" placeholder="Explain in your own words how this works..."></textarea>
         <div class="explain-back-panel-footer">
@@ -1778,7 +2315,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       </div>
     </div>
 
-    <!-- Hint Ladder Section -->
+    <!-- Hint Ladder Section (Requirement D.2: aria-pressed) -->
     <div class="hint-ladder-container">
       <div class="solution-confirm-banner" id="solution-confirm" style="display: none;">
         <div class="solution-confirm-text">Want to try the Structure hint first?</div>
@@ -1789,10 +2326,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       </div>
 
       <div class="hint-buttons-row">
-        <button type="button" class="hint-btn active" data-level="1" id="hint-btn-1" title="Level 1: Nudge (gentle direction, no code)">Nudge (1)</button>
-        <button type="button" class="hint-btn" data-level="2" id="hint-btn-2" title="Level 2: Hint (idea and what to look for)">Hint (2)</button>
-        <button type="button" class="hint-btn" data-level="3" id="hint-btn-3" title="Level 3: Structure (outline, skeleton)">Structure (3)</button>
-        <button type="button" class="hint-btn" data-level="4" id="hint-btn-4" title="Level 4: Solution (full working code)">Solution (4)</button>
+        <button type="button" class="hint-btn active" data-level="1" id="hint-btn-1" aria-pressed="true" title="Level 1: Nudge (gentle direction, no code)">Nudge (1)</button>
+        <button type="button" class="hint-btn" data-level="2" id="hint-btn-2" aria-pressed="false" title="Level 2: Hint (idea and what to look for)">Hint (2)</button>
+        <button type="button" class="hint-btn" data-level="3" id="hint-btn-3" aria-pressed="false" title="Level 3: Structure (outline, skeleton)">Structure (3)</button>
+        <button type="button" class="hint-btn" data-level="4" id="hint-btn-4" aria-pressed="false" title="Level 4: Solution (full working code)">Solution (4)</button>
       </div>
     </div>
 
@@ -1801,7 +2338,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       <textarea id="user-input" placeholder="Ask your mentor a question... (Enter to send, Shift+Enter for newline)"></textarea>
       <div class="input-controls">
         <span class="hint-label">Editor context included</span>
-        <button id="send-btn">Send</button>
+        <button id="send-btn" aria-label="Send message">Send</button>
       </div>
     </div>
   </div>
@@ -1811,11 +2348,27 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     const messagesContainer = document.getElementById('messages-container');
     const welcomeCard = document.getElementById('welcome-card');
+    const welcomeNormalContent = document.getElementById('welcome-normal-content');
+    const welcomeBullets = document.getElementById('welcome-bullets');
+    const welcomeSetupBox = document.getElementById('welcome-setup-box');
+    const welcomeSetKeyBtn = document.getElementById('welcome-set-key-btn');
+
     const userInput = document.getElementById('user-input');
     const sendBtn = document.getElementById('send-btn');
-    const loadingIndicator = document.getElementById('loading-indicator');
+    const loadingRow = document.getElementById('loading-row');
+    const cancelRequestBtn = document.getElementById('cancel-request-btn');
     const newTaskBtn = document.getElementById('new-task-btn');
     const reviewCodeBtn = document.getElementById('review-code-btn');
+
+    // Progress elements
+    const progressToggleBtn = document.getElementById('progress-toggle-btn');
+    const progressPanel = document.getElementById('progress-panel');
+    const closeProgressBtn = document.getElementById('close-progress-btn');
+    const progressList = document.getElementById('progress-list');
+    const initResetProgressBtn = document.getElementById('init-reset-progress-btn');
+    const resetConfirmBox = document.getElementById('reset-confirm-box');
+    const confirmResetProgressBtn = document.getElementById('confirm-reset-progress-btn');
+    const cancelResetProgressBtn = document.getElementById('cancel-reset-progress-btn');
 
     // Course settings elements
     const courseBadgeRow = document.getElementById('course-badge-row');
@@ -1845,18 +2398,59 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     let currentHintLevel = 1;
     let maxAllowedHintLevel = 4;
     let isCourseActive = false;
-    let currentConfigObj = null;
     let isLoading = false;
+    let hasApiKey = false;
+    let isOnboarded = false;
     let hasReplies = false;
 
     // Notify extension host that webview is ready
     vscode.postMessage({ type: 'ready' });
 
     // -------------------------------------------------------------------------
-    // INSTRUCTOR CONFIGURATION SYNC (Requirement A.6)
+    // ONBOARDING & SETUP CARDS (Requirement A)
+    // -------------------------------------------------------------------------
+    function updateWelcomeCardUI() {
+      if (!welcomeCard) return;
+
+      if (!hasApiKey) {
+        // Show setup box in place of actions if API key is not configured
+        if (welcomeNormalContent) welcomeNormalContent.style.display = 'none';
+        if (welcomeSetupBox) welcomeSetupBox.style.display = 'flex';
+      } else {
+        // Normal welcome card
+        if (welcomeSetupBox) welcomeSetupBox.style.display = 'none';
+        if (welcomeNormalContent) welcomeNormalContent.style.display = 'block';
+
+        // Requirement A.3: Short version if already onboarded
+        if (isOnboarded && welcomeBullets) {
+          welcomeBullets.style.display = 'none';
+        } else if (welcomeBullets) {
+          welcomeBullets.style.display = 'flex';
+        }
+      }
+    }
+
+    if (welcomeSetKeyBtn) {
+      welcomeSetKeyBtn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'openSettings' });
+      });
+    }
+
+    // Example prompt chips: clicking fills input without sending (Requirement A.1)
+    document.querySelectorAll('.prompt-chip').forEach(function(chip) {
+      chip.addEventListener('click', function() {
+        const promptText = chip.getAttribute('data-prompt') || chip.textContent;
+        userInput.value = promptText;
+        userInput.style.height = 'auto';
+        userInput.style.height = Math.min(userInput.scrollHeight, 140) + 'px';
+        userInput.focus();
+      });
+    });
+
+    // -------------------------------------------------------------------------
+    // INSTRUCTOR CONFIGURATION (Requirement A.6)
     // -------------------------------------------------------------------------
     function applyConfig(config, active) {
-      currentConfigObj = config;
       isCourseActive = active;
       maxAllowedHintLevel = (config && config.maxHintLevel) ? config.maxHintLevel : 4;
 
@@ -1866,7 +2460,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           courseMaxHintName.textContent = getHintName(maxAllowedHintLevel);
         }
 
-        // Build rich tooltip detailing course settings & learning objectives
         let tooltip = 'Instructor Settings (.mentor.json)\\n' +
                       'Mode: ' + config.mode + '\\n' +
                       'Max hint level: ' + maxAllowedHintLevel + ' (' + getHintName(maxAllowedHintLevel) + ')';
@@ -1881,7 +2474,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         courseBadgeRow.style.display = 'none';
       }
 
-      // Update Hint Ladder buttons according to maxHintLevel
       for (let i = 1; i <= 4; i++) {
         const btn = hintBtns[i];
         if (btn) {
@@ -1897,28 +2489,28 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      // Clamp current level if above limit
       if (currentHintLevel > maxAllowedHintLevel) {
         selectHintLevel(maxAllowedHintLevel);
       }
     }
 
     function selectHintLevel(level) {
-      // Clamp to maximum allowed level
       currentHintLevel = Math.min(level, maxAllowedHintLevel);
       for (let i = 1; i <= 4; i++) {
         if (hintBtns[i]) {
-          if (i === currentHintLevel) {
+          const isActive = (i === currentHintLevel);
+          if (isActive) {
             hintBtns[i].classList.add('active');
+            hintBtns[i].setAttribute('aria-pressed', 'true');
           } else {
             hintBtns[i].classList.remove('active');
+            hintBtns[i].setAttribute('aria-pressed', 'false');
           }
         }
       }
     }
 
     function showSolutionConfirmation() {
-      // Requirement A.6: Solution soft-confirmation only applies if level 4 is allowed
       if (maxAllowedHintLevel >= 4 && solutionConfirmBanner) {
         solutionConfirmBanner.style.display = 'flex';
       }
@@ -1931,7 +2523,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     function handleHintBtnClick(level) {
-      if (level > maxAllowedHintLevel) {
+      if (level > maxAllowedHintLevel || isLoading) {
         return;
       }
       if (level === 4 && currentHintLevel < 3 && maxAllowedHintLevel >= 4) {
@@ -1961,6 +2553,106 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       confirmSolutionBtn.addEventListener('click', function() {
         hideSolutionConfirmation();
         selectHintLevel(4);
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // PROGRESS PANEL (Requirement F)
+    // -------------------------------------------------------------------------
+    if (progressToggleBtn) {
+      progressToggleBtn.addEventListener('click', function() {
+        const isVisible = (progressPanel.style.display === 'flex');
+        if (isVisible) {
+          progressPanel.style.display = 'none';
+        } else {
+          progressPanel.style.display = 'flex';
+          vscode.postMessage({ type: 'getConcepts' });
+        }
+      });
+    }
+
+    if (closeProgressBtn) {
+      closeProgressBtn.addEventListener('click', function() {
+        progressPanel.style.display = 'none';
+      });
+    }
+
+    if (initResetProgressBtn) {
+      initResetProgressBtn.addEventListener('click', function() {
+        initResetProgressBtn.style.display = 'none';
+        resetConfirmBox.style.display = 'flex';
+      });
+    }
+
+    if (cancelResetProgressBtn) {
+      cancelResetProgressBtn.addEventListener('click', function() {
+        resetConfirmBox.style.display = 'none';
+        initResetProgressBtn.style.display = 'inline-block';
+      });
+    }
+
+    if (confirmResetProgressBtn) {
+      confirmResetProgressBtn.addEventListener('click', function() {
+        resetConfirmBox.style.display = 'none';
+        initResetProgressBtn.style.display = 'inline-block';
+        vscode.postMessage({ type: 'resetConcepts' });
+      });
+    }
+
+    function renderProgressList(concepts) {
+      progressList.innerHTML = '';
+      const entries = Object.entries(concepts || {});
+
+      if (entries.length === 0) {
+        const emptyEl = document.createElement('div');
+        emptyEl.className = 'progress-empty-msg';
+        emptyEl.textContent = 'Concepts you learn will appear here.';
+        progressList.appendChild(emptyEl);
+        return;
+      }
+
+      // Sort by most recent
+      entries.sort(function(a, b) {
+        const dateA = a[1].lastSeen || '';
+        const dateB = b[1].lastSeen || '';
+        return dateB.localeCompare(dateA);
+      });
+
+      entries.forEach(function(item) {
+        const name = item[0];
+        const data = item[1];
+
+        const row = document.createElement('div');
+        row.className = 'progress-item';
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'progress-item-name';
+        nameSpan.textContent = name;
+
+        const metaSpan = document.createElement('span');
+        metaSpan.className = 'progress-item-meta';
+
+        const countSpan = document.createElement('span');
+        countSpan.textContent = data.count + 'x';
+
+        const dateSpan = document.createElement('span');
+        let dateFormatted = '';
+        if (data.lastSeen) {
+          try {
+            dateFormatted = new Date(data.lastSeen).toLocaleDateString();
+          } catch {
+            dateFormatted = data.lastSeen.slice(0, 10);
+          }
+        }
+        dateSpan.textContent = dateFormatted;
+
+        metaSpan.appendChild(countSpan);
+        metaSpan.appendChild(dateSpan);
+
+        row.appendChild(nameSpan);
+        row.appendChild(metaSpan);
+
+        progressList.appendChild(row);
       });
     }
 
@@ -2051,12 +2743,26 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     sendBtn.addEventListener('click', sendMessage);
 
+    // Keyboard handlers (Requirement D.4: Enter sends, Shift+Enter newline, Escape cancels)
     userInput.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
       }
     });
+
+    window.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape' && isLoading) {
+        e.preventDefault();
+        vscode.postMessage({ type: 'cancelRequest' });
+      }
+    });
+
+    if (cancelRequestBtn) {
+      cancelRequestBtn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'cancelRequest' });
+      });
+    }
 
     userInput.addEventListener('input', function() {
       userInput.style.height = 'auto';
@@ -2074,6 +2780,18 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       const message = event.data;
 
       switch (message.type) {
+        case 'apiKeyStatus': {
+          hasApiKey = message.hasApiKey;
+          updateWelcomeCardUI();
+          break;
+        }
+
+        case 'onboardedStatus': {
+          isOnboarded = message.isOnboarded;
+          updateWelcomeCardUI();
+          break;
+        }
+
         case 'config': {
           applyConfig(message.config, message.active);
           break;
@@ -2094,8 +2812,24 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           break;
         }
 
+        case 'requestCancelled': {
+          // Leaves learner's message with a subtle note "Request cancelled." (Requirement B.2)
+          appendCancelledNote();
+          break;
+        }
+
+        case 'friendlyError': {
+          // Requirement C.1: Friendly error card with retry / settings button
+          renderFriendlyErrorCard(message);
+          break;
+        }
+
+        case 'conceptsData': {
+          renderProgressList(message.concepts);
+          break;
+        }
+
         case 'pasteCheckPrompt': {
-          // Requirement B.6: Render inline panel for learner to explain pasted code
           renderPasteCheckPrompt(message);
           break;
         }
@@ -2105,17 +2839,17 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           break;
         }
 
-        case 'error': {
-          appendErrorMessage(message.message, message.isApiKeyError);
-          break;
-        }
-
         case 'taskReset':
         case 'historyCleared': {
           messagesContainer.innerHTML = '';
+          if (progressPanel) {
+            progressPanel.style.display = 'none';
+            messagesContainer.appendChild(progressPanel);
+          }
           if (welcomeCard) {
-            welcomeCard.style.display = 'block';
+            welcomeCard.style.display = 'flex';
             messagesContainer.appendChild(welcomeCard);
+            updateWelcomeCardUI();
           }
           selectHintLevel(1);
           hideSolutionConfirmation();
@@ -2154,12 +2888,20 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     function setLoading(loading) {
       isLoading = loading;
       sendBtn.disabled = loading;
+
+      // Disable hint buttons during loading (Requirement B.1)
+      for (let i = 1; i <= 4; i++) {
+        if (hintBtns[i]) {
+          hintBtns[i].disabled = loading || (i > maxAllowedHintLevel);
+        }
+      }
+
+      // Keep textarea usable (userInput is NOT disabled)
       if (loading) {
-        loadingIndicator.classList.add('visible');
-        messagesContainer.appendChild(loadingIndicator);
-        scrollToBottom();
+        loadingRow.classList.add('visible');
+        scrollToBottom(false);
       } else {
-        loadingIndicator.classList.remove('visible');
+        loadingRow.classList.remove('visible');
       }
     }
 
@@ -2177,7 +2919,15 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       row.appendChild(bubble);
       messagesContainer.appendChild(row);
-      scrollToBottom();
+      scrollToBottom(true);
+    }
+
+    function appendCancelledNote() {
+      const note = document.createElement('div');
+      note.className = 'cancelled-note';
+      note.textContent = 'Request cancelled.';
+      messagesContainer.appendChild(note);
+      scrollToBottom(true);
     }
 
     function appendNoticeMessage(text) {
@@ -2200,13 +2950,74 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       card.appendChild(textSpan);
       row.appendChild(card);
       messagesContainer.appendChild(row);
-      scrollToBottom();
+      scrollToBottom(true);
     }
 
     /**
-     * Requirement B.6: Renders inline prompt card in chat for explaining pasted code.
-     * Keeps code in memory only. Pasted code is escaped and enclosed in a collapsed <details>.
+     * Requirement C.1: Friendly error card with retry/countdown/settings.
      */
+    function renderFriendlyErrorCard(data) {
+      if (welcomeCard) {
+        welcomeCard.style.display = 'none';
+      }
+
+      const row = document.createElement('div');
+      row.className = 'message-row';
+
+      const card = document.createElement('div');
+      card.className = 'error-card';
+
+      const textEl = document.createElement('div');
+      textEl.className = 'error-card-text';
+      textEl.textContent = '⚠️ ' + data.message;
+      card.appendChild(textEl);
+
+      if (data.action === 'openSettings') {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn-action';
+        btn.textContent = data.actionLabel || 'Open settings';
+        btn.addEventListener('click', function() {
+          vscode.postMessage({ type: 'openSettings' });
+        });
+        card.appendChild(btn);
+      } else if (data.action === 'retry') {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn-action';
+
+        if (data.countdown && data.countdown > 0) {
+          let remaining = data.countdown;
+          btn.disabled = true;
+          btn.textContent = 'Retry (' + remaining + 's)';
+
+          const timer = setInterval(function() {
+            remaining--;
+            if (remaining > 0) {
+              btn.textContent = 'Retry (' + remaining + 's)';
+            } else {
+              clearInterval(timer);
+              btn.disabled = false;
+              btn.textContent = 'Retry';
+            }
+          }, 1000);
+        } else {
+          btn.textContent = 'Retry';
+        }
+
+        btn.addEventListener('click', function() {
+          btn.disabled = true;
+          vscode.postMessage({ type: 'retryLast' });
+        });
+
+        card.appendChild(btn);
+      }
+
+      row.appendChild(card);
+      messagesContainer.appendChild(row);
+      scrollToBottom(true);
+    }
+
     function renderPasteCheckPrompt(data) {
       if (welcomeCard) {
         welcomeCard.style.display = 'none';
@@ -2283,18 +3094,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       row.appendChild(panel);
       messagesContainer.appendChild(row);
-      scrollToBottom();
+      scrollToBottom(true);
       textarea.focus();
     }
 
-    /**
-     * renderMentorReplyCard:
-     * Supports modes:
-     * - 'task': Default ladder card
-     * - 'explain': Explain mode with line notes
-     * - 'review': Review mode with findings cards
-     * - 'explain_back' and 'paste_check': Understanding check cards
-     */
     function renderMentorReplyCard(reply, mode) {
       if (!reply || typeof reply !== 'object') {
         reply = {
@@ -2375,7 +3178,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(messageEl);
       }
 
-      // 3. Line notes (used in explain mode)
+      // 3. Line notes
       if (Array.isArray(reply.line_notes) && reply.line_notes.length > 0) {
         const validNotes = reply.line_notes.filter(function(n) {
           return n && (n.code || n.note);
@@ -2472,7 +3275,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      // 5. Explain Back and Paste Check assessment card (Requirement B.6: SAME card)
+      // 5. Explain Back & Paste Check assessment
       const hasExplainBackData = reply.understanding ||
         (Array.isArray(reply.got_right) && reply.got_right.length > 0) ||
         (Array.isArray(reply.gaps) && reply.gaps.length > 0);
@@ -2579,7 +3382,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         card.appendChild(nextStepBox);
       }
 
-      // 8. Code snippet block with Copy button
+      // 8. Code snippet block
       if (reply.code_snippet && reply.code_snippet.trim()) {
         const snippetText = reply.code_snippet.trim();
 
@@ -2596,7 +3399,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         const copyBtn = document.createElement('button');
         copyBtn.className = 'copy-code-btn';
         copyBtn.textContent = 'Copy';
-        copyBtn.title = 'Copy snippet to clipboard';
+        copyBtn.setAttribute('aria-label', 'Copy code snippet to clipboard');
 
         copyBtn.addEventListener('click', function() {
           copySnippetToClipboard(snippetText, copyBtn);
@@ -2642,7 +3445,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       // 10. "Need more help?" button
-      // Requirement A.6: Hide once current level equals maximum allowed level
       if (!hideLadderControls) {
         const replyLevel = reply.hint_level || currentHintLevel || 1;
         if (replyLevel < maxAllowedHintLevel) {
@@ -2668,7 +3470,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       row.appendChild(card);
       messagesContainer.appendChild(row);
-      scrollToBottom();
+      scrollToBottom(false);
     }
 
     function copySnippetToClipboard(text, button) {
@@ -2694,7 +3496,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         document.execCommand('copy');
         showCopied(button);
       } catch (e) {
-        console.error('Copy failed:', e);
+        // silent
       }
       document.body.removeChild(textarea);
     }
@@ -2729,34 +3531,13 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    function appendErrorMessage(errorText, isApiKeyError) {
-      const row = document.createElement('div');
-      row.className = 'message-row';
-
-      const card = document.createElement('div');
-      card.className = 'error-card';
-
-      const textEl = document.createElement('div');
-      textEl.textContent = '⚠️ ' + errorText;
-      card.appendChild(textEl);
-
-      if (isApiKeyError) {
-        const actionBtn = document.createElement('button');
-        actionBtn.className = 'btn-action';
-        actionBtn.textContent = 'Configure Gemini API Key';
-        actionBtn.addEventListener('click', function() {
-          vscode.postMessage({ type: 'openSettings' });
-        });
-        card.appendChild(actionBtn);
+    // Requirement D.7: Smart scroll that does not jump if user scrolled up
+    function scrollToBottom(force) {
+      const threshold = 100;
+      const isNearBottom = (messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight) <= threshold;
+      if (force || isNearBottom) {
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
       }
-
-      row.appendChild(card);
-      messagesContainer.appendChild(row);
-      scrollToBottom();
-    }
-
-    function scrollToBottom() {
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
     }
   </script>
 </body>

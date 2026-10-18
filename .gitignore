@@ -1,6 +1,26 @@
-out
-node_modules
-.vscode-test
+# Compilation output
+out/
+
+# Dependencies
+node_modules/
+
+# Testing
+.vscode-test/
+
+# Packaging
 *.vsix
+
+# OS metadata
 .DS_Store
-.vscode/settings.json
+Thumbs.db
+
+# VS Code local settings
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# Environment and sensitive keys
+.env
+.env.*
+*.env
+*.log

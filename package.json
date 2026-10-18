@@ -1,17 +1,40 @@
 {
   "name": "code-mentor",
   "displayName": "Code Mentor",
-  "description": "An AI coding mentor for beginners that teaches instead of just generating code.",
-  "version": "0.0.1",
+  "description": "An AI coding mentor for beginners that teaches instead of generating code.",
+  "version": "0.1.0",
+  "publisher": "code-mentor-team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TODO-YOUR-USERNAME/code-mentor"
+  },
+  "icon": "resources/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
-    "Other",
-    "Programming Languages",
-    "Education"
+    "Education",
+    "Other"
   ],
-  "activationEvents": [],
+  "keywords": [
+    "ai",
+    "mentor",
+    "education",
+    "learning",
+    "tutor",
+    "beginner",
+    "web development"
+  ],
+  "activationEvents": [
+    "onView:mentor.chat",
+    "onCommand:mentor.openChat",
+    "onCommand:mentor.explainSelection",
+    "onCommand:mentor.reviewFile",
+    "onCommand:mentor.createConfig",
+    "onCommand:mentor.testConnection",
+    "onCommand:mentor.showLogs"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {
@@ -48,6 +71,14 @@
       {
         "command": "mentor.createConfig",
         "title": "Mentor: Create Course Config (.mentor.json)"
+      },
+      {
+        "command": "mentor.testConnection",
+        "title": "Mentor: Test API Connection"
+      },
+      {
+        "command": "mentor.showLogs",
+        "title": "Mentor: Show Logs"
       }
     ],
     "menus": {

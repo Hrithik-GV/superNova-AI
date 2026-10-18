@@ -90,10 +90,10 @@ Rules for the JSON:
 - understanding, got_right, and gaps are for explain_back and paste_check modes; set to null or omit in other modes.
 - Escape newlines and quotes inside strings properly.`;
 
-export function buildSystemPrompt(config: MentorConfig, active: boolean): string {
+export function buildSystemPrompt(config: MentorConfig = DEFAULT_CONFIG, active: boolean = false): string {
   if (!active) return SYSTEM_PROMPT;
 
-  const objectives = config.learningObjectives.length
+  const objectives = config.learningObjectives && config.learningObjectives.length
     ? config.learningObjectives.map(o => `- ${o}`).join('\n')
     : '- (none specified)';
 
@@ -111,42 +111,3 @@ ${objectives}
 When relevant, connect your guidance to these objectives and say which one a step supports. Do not drift into topics outside them unless the learner asks.`;
 }
 
-/**
- * Dynamically constructs the system prompt based on instructor configuration (.mentor.json).
- * Injects course mode (beginner/intermediate), maximum hint level clamp, and course learning objectives.
- *
- * @param config - The active or default MentorConfig
- * @param active - Whether an instructor .mentor.json file is active in the workspace
- * @returns Fully assembled system prompt string
- */
-export function buildSystemPrompt(config?: MentorConfig, active?: boolean): string {
-  const effectiveConfig = config || DEFAULT_CONFIG;
-  let prompt = SYSTEM_PROMPT;
-
-  if (active) {
-    let courseSection = '\n\nCOURSE CONFIGURATION (.mentor.json ACTIVE):';
-
-    // 1. Learner mode guidance
-    if (effectiveConfig.mode === 'intermediate') {
-      courseSection += '\n- Learner Level: Intermediate. Expect familiarity with basic syntax; emphasize design patterns, best practices, maintainability, and clean architecture.';
-    } else {
-      courseSection += '\n- Learner Level: Beginner. Keep explanations gentle, define technical terms in simple language, and break steps into bite-sized actions.';
-    }
-
-    // 2. Maximum hint level restriction
-    courseSection += `\n- COURSE MAX HINT LEVEL: Level ${effectiveConfig.maxHintLevel}. Under NO circumstances provide help, code, or answers exceeding Level ${effectiveConfig.maxHintLevel}.`;
-
-    // 3. Learning objectives
-    if (Array.isArray(effectiveConfig.learningObjectives) && effectiveConfig.learningObjectives.length > 0) {
-      courseSection += '\n- INSTRUCTOR LEARNING OBJECTIVES:';
-      for (const obj of effectiveConfig.learningObjectives) {
-        courseSection += `\n  * ${obj}`;
-      }
-      courseSection += '\nPrioritize connecting explanations, questions, and observations to these learning objectives whenever relevant.';
-    }
-
-    prompt += courseSection;
-  }
-
-  return prompt;
-}

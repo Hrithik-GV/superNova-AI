@@ -118,3 +118,18 @@ export async function saveConcepts(
     console.error('Code Mentor: Failed to save concepts to globalState:', err);
   }
 }
+
+/**
+ * Resets all tracked concepts in globalState.
+ */
+export async function clearConcepts(globalState?: vscode.Memento): Promise<void> {
+  try {
+    const state = globalState || _globalStateRef;
+    if (state) {
+      await state.update(CONCEPTS_STORAGE_KEY, {});
+    }
+  } catch (err) {
+    console.error('Code Mentor: Failed to clear concepts from globalState:', err);
+  }
+}
+

@@ -261,7 +261,8 @@ export function parseMentorReply(raw: string): MentorReply {
 export async function askMentor(
   history: ChatMessage[],
   config?: MentorConfig,
-  activeConfig?: boolean
+  activeConfig?: boolean,
+  abortSignal?: AbortSignal
 ): Promise<string> {
   // Read API key and model from VS Code configuration
   const vsConfig = vscode.workspace.getConfiguration('mentor');
@@ -294,13 +295,78 @@ export async function askMentor(
     parts: [{ text: msg.content }]
   }));
 
-  // Request structured JSON response from Gemini
-  const response = await model.generateContent({
-    contents,
-    generationConfig: {
-      responseMimeType: 'application/json'
-    }
-  });
+  // Request structured JSON response from Gemini with optional abortSignal
+  const requestOptions: any = {};
+  if (abortSignal) {
+    requestOptions.signal = abortSignal;
+  }
+
+  const response = await model.generateContent(
+    {
+      contents,
+      generationConfig: {
+        responseMimeType: 'application/json'
+      }
+    },
+    requestOptions
+  );
 
   return response.response.text();
 }
+
+/**
+ * Tests the Gemini API connection with a minimal request ("reply with OK").
+ * Does not expose the API key or secret data in error strings.
+ *
+ * @returns Result object with success flag and sanitized error message if failed.
+ */
+export async function testApiConnection(): Promise<{ success: boolean; message: string }> {
+  const vsConfig = vscode.workspace.getConfiguration('mentor');
+  const apiKey = (vsConfig.get<string>('apiKey', '') || vsConfig.get<string>('apikey', '')).trim();
+  const modelName = vsConfig.get<string>('model', 'gemini-3.5-flash').trim() || 'gemini-3.5-flash';
+
+  if (!apiKey) {
+    return {
+      success: false,
+      message: 'No API key configured. Please set your Gemini API key in settings.'
+    };
+  }
+
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: modelName });
+    const result = await model.generateContent(
+      'Reply with OK',
+      { timeout: 15000 }
+    );
+    const text = result.response.text();
+    if (text && text.trim().length > 0) {
+      return {
+        success: true,
+        message: `Successfully connected to ${modelName}!`
+      };
+    }
+    return {
+      success: false,
+      message: 'Connection succeeded but received an empty response.'
+    };
+  } catch (err: any) {
+    let msg = 'Failed to connect to Google Gemini API.';
+    if (err?.status === 400 || err?.status === 401 || err?.status === 403) {
+      msg = 'API key was rejected. Check that your key is correct and active.';
+    } else if (err?.status === 404 || err?.message?.includes('not found')) {
+      msg = `Model "${modelName}" was not found. Check the "mentor.model" setting.`;
+    } else if (err?.status === 429) {
+      msg = 'Rate limit reached or quota exceeded.';
+    } else if (err?.message?.includes('fetch failed') || err?.code === 'ENOTFOUND') {
+      msg = 'Network connection failed. Check your internet connection.';
+    } else if (err?.message) {
+      msg = err.message;
+    }
+    return {
+      success: false,
+      message: msg
+    };
+  }
+}
+
