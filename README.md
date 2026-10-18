@@ -91,7 +91,7 @@ The LLM is strictly constrained never to provide complete solutions on initial r
 
 ## Setup
 
-Code Mentor communicates directly with Google's Gemini API (e.g. `gemini-3.5-flash` or `gemini-1.5-flash`), which provides a generous free tier for developers and students.
+Code Mentor communicates directly with Google's Gemini API (e.g. `gemini-3.5-flash-lite` or `gemini-flash-lite-latest`), which provides a generous free tier for developers and students.
 
 1. **Get an API Key**:
    - Visit [Google AI Studio](https://aistudio.google.com/).
@@ -101,11 +101,11 @@ Code Mentor communicates directly with Google's Gemini API (e.g. `gemini-3.5-fla
    - In VS Code, open Settings (`Ctrl+,` or `Cmd+,`).
    - Search for `Code Mentor` (or `mentor.apiKey`).
    - Paste your key into **Mentor: Api Key** (`mentor.apiKey`).
-   - *(Optional)* Adjust **Mentor: Model** (`mentor.model`) to your preferred model (default: `gemini-3.5-flash`).
+   - *(Optional)* Adjust **Mentor: Model** (`mentor.model`) to your preferred model (default: `gemini-3.5-flash-lite`).
 3. **Verify Connection**:
    - Open the Command Palette (`Ctrl+Shift+P` or `Cmd+Shift+P`).
    - Run **Mentor: Test API Connection**.
-   - You should see a notification confirming: *"Code Mentor: Successfully connected to gemini-3.5-flash!"*.
+   - You should see a notification confirming: *"Code Mentor: Successfully connected to gemini-3.5-flash-lite!"*.
 
 ---
 

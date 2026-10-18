@@ -267,7 +267,7 @@ export async function askMentor(
   // Read API key and model from VS Code configuration
   const vsConfig = vscode.workspace.getConfiguration('mentor');
   const apiKey = (vsConfig.get<string>('apiKey', '') || vsConfig.get<string>('apikey', '')).trim();
-  const modelName = vsConfig.get<string>('model', 'gemini-3.5-flash').trim() || 'gemini-3.5-flash';
+  const modelName = vsConfig.get<string>('model', 'gemini-3.5-flash-lite').trim() || 'gemini-3.5-flash-lite';
 
   if (!apiKey) {
     throw new MissingApiKeyError('No Gemini API key found. Please configure "mentor.apiKey" in your settings.');
@@ -323,7 +323,7 @@ export async function askMentor(
 export async function testApiConnection(): Promise<{ success: boolean; message: string }> {
   const vsConfig = vscode.workspace.getConfiguration('mentor');
   const apiKey = (vsConfig.get<string>('apiKey', '') || vsConfig.get<string>('apikey', '')).trim();
-  const modelName = vsConfig.get<string>('model', 'gemini-3.5-flash').trim() || 'gemini-3.5-flash';
+  const modelName = vsConfig.get<string>('model', 'gemini-3.5-flash-lite').trim() || 'gemini-3.5-flash-lite';
 
   if (!apiKey) {
     return {
