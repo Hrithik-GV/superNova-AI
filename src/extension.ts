@@ -8,7 +8,10 @@ import {
   LineNote,
   ReviewFinding,
   MissingApiKeyError,
-  testApiConnection
+  testApiConnection,
+  DEFAULT_MODEL,
+  getResolvedModel,
+  getResolvedFallbackModel
 } from './llm';
 import {
   initProgress,
@@ -27,6 +30,34 @@ import {
   registerPasteDetector,
   PasteEventPayload
 } from './paste';
+import {
+  Session,
+  StoredMessage,
+  getAllSessions,
+  getSessionById,
+  getActiveSession,
+  setActiveSessionId,
+  createNewSession,
+  saveSession,
+  deleteSession,
+  clearAllSessions,
+  getMostRecentSession,
+  formatRelativeDate,
+  extractSessionConcepts
+} from './sessions';
+
+/**
+ * Returns the human-friendly name for a hint level (1: Nudge, 2: Hint, 3: Structure, 4: Solution).
+ */
+function getHintName(level: number): string {
+  switch (level) {
+    case 1: return 'Nudge';
+    case 2: return 'Hint';
+    case 3: return 'Structure';
+    case 4: return 'Solution';
+    default: return `Level ${level}`;
+  }
+}
 
 /**
  * Output channel for extension logging.
@@ -43,10 +74,51 @@ function logError(message: string, error?: any): void {
   let detail = '';
   if (error) {
     detail = error.message || String(error);
-    // Sanitize any accidental API key patterns (AIza...)
-    detail = detail.replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]');
+    // Sanitize any accidental API key patterns (AIza..., AQ...)
+    detail = detail
+      .replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]')
+      .replace(/AQ\.[0-9A-Za-z-_]{20,}/g, '[REDACTED_API_KEY]')
+      .replace(/sk-[0-9A-Za-z-_]{20,}/g, '[REDACTED_API_KEY]');
   }
   logChannel.appendLine(`[${timestamp}] ERROR: ${message} ${detail}`.trim());
+}
+
+/**
+ * Logs API errors to the "Code Mentor" output channel according to Requirement 2:
+ * Includes HTTP status, model name used, request mode, and the first 300 characters
+ * of the error body (strictly sanitized so API keys are never leaked).
+ */
+function logApiError(
+  status: number | string | undefined,
+  modelName: string,
+  mode: string,
+  error: any
+): void {
+  const timestamp = new Date().toISOString();
+  let body = '';
+  if (error?.message) {
+    body = error.message;
+  } else if (error?.errorDetails) {
+    body = typeof error.errorDetails === 'string'
+      ? error.errorDetails
+      : JSON.stringify(error.errorDetails);
+  } else {
+    body = String(error || '');
+  }
+
+  // Redact potential API keys or secrets (AIza, sk-, AQ., or key= in URLs)
+  body = body
+    .replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]')
+    .replace(/AQ\.[0-9A-Za-z-_]{20,}/g, '[REDACTED_API_KEY]')
+    .replace(/sk-[0-9A-Za-z-_]{20,}/g, '[REDACTED_API_KEY]')
+    .replace(/key=[^&\s]+/gi, 'key=[REDACTED]');
+
+  const truncatedBody = body.slice(0, 300);
+  const statusStr = status !== undefined && status !== null ? String(status) : 'unknown';
+
+  logChannel.appendLine(
+    `[${timestamp}] API ERROR: status=${statusStr}, model=${modelName}, mode=${mode}, body=${truncatedBody}`
+  );
 }
 
 /**
@@ -185,6 +257,7 @@ export async function activate(context: vscode.ExtensionContext) {
           if (res.success) {
             vscode.window.showInformationMessage(`Code Mentor: ${res.message}`);
           } else {
+            logApiError(res.status, res.modelUsed, 'testConnection', res.errorBody || res.message);
             vscode.window.showErrorMessage(`Code Mentor: ${res.message}`);
           }
         }
@@ -196,6 +269,22 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('mentor.showLogs', () => {
       logChannel.show();
+    })
+  );
+
+  // Requirement 8: "Mentor: Resume Last Session" command
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mentor.resumeLastSession', async () => {
+      await vscode.commands.executeCommand('mentor.chat.focus');
+      await provider.resumeLastSession();
+    })
+  );
+
+  // Requirement 8: "Mentor: Show Chat History" command
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mentor.showHistory', async () => {
+      await vscode.commands.executeCommand('mentor.chat.focus');
+      await provider.showHistory();
     })
   );
 }
@@ -219,6 +308,12 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   private _currentTaskText: string = '';
   private _currentMode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' = 'task';
 
+  // Persistent session management (Requirements 1, 3, 5)
+  private _activeSession: Session | null = null;
+  private _pendingLearnerVisibleText: string | null = null;
+  private _pendingShowHistory: boolean = false;
+  private _pendingResumeLastSession: boolean = false;
+
   // Active instructor configuration state
   private _currentConfig: MentorConfig;
   private _activeConfig: boolean;
@@ -238,6 +333,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     content: string;
     mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check';
     hintLevel: number;
+    learnerVisibleText?: string;
   } | null = null;
 
   // Webview lifecycle readiness and queued pending requests
@@ -259,6 +355,35 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     this._activeConfig = initialActive;
     this._isOnboarded = initialOnboarded;
     this._hasApiKey = initialHasApiKey;
+
+    // Load active session from globalState if present (Requirements 1, 5)
+    try {
+      this._activeSession = getActiveSession(this._globalState);
+      if (this._activeSession) {
+        // Clamp restored hint level to config if active (Requirement 9)
+        const effectiveMax = this._currentConfig.maxHintLevel;
+        this._currentLevel = Math.min(this._activeSession.hintLevel || 1, effectiveMax) as 1 | 2 | 3 | 4;
+        this._currentTaskText = this._activeSession.originalTask || '';
+
+        // Rebuild in-memory LLM history from session.messages (Requirement 5)
+        this._history = this._activeSession.messages.map(m => ({
+          role: m.role,
+          content: m.text
+        }));
+
+        // Restore mode
+        if (this._activeSession.messages.length > 0) {
+          const lastMode = this._activeSession.messages[this._activeSession.messages.length - 1].mode;
+          if (lastMode === 'explain' || lastMode === 'review' || lastMode === 'explain_back' || lastMode === 'paste_check') {
+            this._currentMode = lastMode;
+          } else {
+            this._currentMode = 'task';
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Code Mentor: Failed to load active session during provider construction:', err);
+    }
   }
 
   public updateConfig(config: MentorConfig, active: boolean): void {
@@ -325,8 +450,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             isOnboarded: this._isOnboarded
           });
 
-          // Dispatch any actions queued while sidebar was closed
-          if (this._pendingNotice) {
+          // Check command queues first (Requirement 8)
+          if (this._pendingResumeLastSession) {
+            this._pendingResumeLastSession = false;
+            await this.resumeLastSession();
+          } else if (this._pendingShowHistory) {
+            this._pendingShowHistory = false;
+            await this.showHistory();
+          } else if (this._pendingNotice) {
             const notice = this._pendingNotice;
             this._pendingNotice = null;
             this._postMessageToWebview({
@@ -345,6 +476,18 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             const pending = this._pendingPasteExplain;
             this._pendingPasteExplain = null;
             await this._promptPasteCheckInWebview(pending);
+          } else if (this._activeSession && this._activeSession.messages.length > 0) {
+            // Restore active session to webview (Requirement 5)
+            const effectiveMax = this._currentConfig.maxHintLevel;
+            this._activeSession.hintLevel = Math.min(this._activeSession.hintLevel, effectiveMax) as 1 | 2 | 3 | 4;
+            this._currentLevel = this._activeSession.hintLevel;
+            this._postMessageToWebview({
+              type: 'restore',
+              session: this._activeSession
+            });
+          } else {
+            // Empty chat: check if past session exists for Welcome Continue Card (Requirement 7)
+            this._checkAndPostWelcomeContinueCard();
           }
           break;
         }
@@ -415,8 +558,69 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             this._lastRequest.content,
             this._lastRequest.mode,
             this._lastRequest.hintLevel,
-            true // isRetry
+            true, // isRetry
+            this._lastRequest.learnerVisibleText
           );
+          break;
+        }
+
+        case 'getSessions': {
+          // Requirement 6: Provide list of past sessions to History panel
+          this._postSessionsList();
+          break;
+        }
+
+        case 'resumeSession': {
+          // Requirement 6: Resume a specific session by ID
+          if (message.sessionId) {
+            await this.resumeSessionById(message.sessionId);
+          }
+          break;
+        }
+
+        case 'deleteSession': {
+          // Requirement 6: Delete a session by ID
+          if (message.sessionId) {
+            await deleteSession(this._globalState, message.sessionId);
+            if (this._activeSession && this._activeSession.id === message.sessionId) {
+              this._activeSession = null;
+              this._history = [];
+              this._currentLevel = 1;
+              this._currentTaskText = '';
+              this._currentMode = 'task';
+              this._lastRequest = null;
+              this._postMessageToWebview({ type: 'taskReset' });
+              this._checkAndPostWelcomeContinueCard();
+            }
+            this._postSessionsList();
+          }
+          break;
+        }
+
+        case 'clearAllSessions': {
+          // Requirement 6: Clear all sessions
+          await clearAllSessions(this._globalState);
+          this._activeSession = null;
+          this._history = [];
+          this._currentLevel = 1;
+          this._currentTaskText = '';
+          this._currentMode = 'task';
+          this._lastRequest = null;
+          this._postMessageToWebview({ type: 'taskReset' });
+          this._postSessionsList();
+          break;
+        }
+
+        case 'hintLevelChanged': {
+          // Requirement 3: Autosave on hint level change
+          const lvl = (message.level === 1 || message.level === 2 || message.level === 3 || message.level === 4)
+            ? message.level
+            : 1;
+          this._currentLevel = lvl;
+          if (this._activeSession) {
+            this._activeSession.hintLevel = lvl;
+            await saveSession(this._globalState, this._activeSession);
+          }
           break;
         }
 
@@ -442,7 +646,12 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
         case 'newTask':
         case 'clearHistory': {
-          // Clears conversation history, resets level to 1, and clears chat UI
+          // Requirement 4: Save current session first, then start fresh empty session, reset level to 1, clear chat UI
+          if (this._activeSession && this._activeSession.messages.length > 0) {
+            await saveSession(this._globalState, this._activeSession);
+          }
+          this._activeSession = null;
+          await setActiveSessionId(this._globalState, null);
           this._history = [];
           this._currentLevel = 1;
           this._currentTaskText = '';
@@ -451,6 +660,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           this._postMessageToWebview({
             type: 'taskReset'
           });
+          this._checkAndPostWelcomeContinueCard();
           break;
         }
 
@@ -494,7 +704,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       });
 
       const prompt = `Mode: explain\nFile: ${payload.fileName} (${payload.languageId})\nSelected code:\n${payload.pastedCode}`;
-      await this._executePrompt(prompt, 'explain', 1);
+      await this._executePrompt(prompt, 'explain', 1, false, 'Explaining the pasted code...');
     } else if (payload.action === 'explain_it') {
       if (!this._view || !this._isWebviewReady) {
         this._pendingPasteExplain = payload;
@@ -539,7 +749,13 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     const prompt = `Mode: paste_check\nFile: ${fileName} (${languageId})\nPasted code:\n${code}\nLearner's explanation:\n${explanation}`;
-    await this._executePrompt(prompt, 'paste_check', 1);
+    await this._executePrompt(
+      prompt,
+      'paste_check',
+      1,
+      false,
+      explanation ? `Checking understanding of pasted code: ${explanation}` : 'Checking my understanding of the pasted code...'
+    );
   }
 
   public async explainSelection(fileName: string, languageId: string, selectedText: string): Promise<void> {
@@ -567,7 +783,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     const prompt = `Mode: explain\nFile: ${fileName} (${languageId})\nSelected code:\n${code}`;
-    await this._executePrompt(prompt, 'explain', 1);
+    await this._executePrompt(prompt, 'explain', 1, false, 'Explaining your selection...');
   }
 
   public async reviewActiveFile(editor?: vscode.TextEditor): Promise<void> {
@@ -626,7 +842,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     const prompt = `Mode: review\nFile: ${fileName} (${languageId})\nCurrent file:\n${code}`;
-    await this._executePrompt(prompt, 'review', 1);
+    await this._executePrompt(prompt, 'review', 1, false, `Reviewing ${fileName}...`);
   }
 
   private async _handleExplainBack(learnerExplanation: string): Promise<void> {
@@ -657,7 +873,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     const prompt = `Mode: explain_back\nTask: ${task}${fileSection}\nLearner's explanation:\n${trimmedExplanation}`;
-    await this._executePrompt(prompt, 'explain_back', 1);
+    await this._executePrompt(prompt, 'explain_back', 1, false, trimmedExplanation);
   }
 
   private async _handleUserAsk(userText: string, hintLevel?: number) {
@@ -689,7 +905,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       userMessageContent = `${contextBlock}\n\nLearner Question:\n${trimmedText}\n\n${hintLevelLabel}`;
     }
 
-    await this._executePrompt(userMessageContent, 'task', clampedLevel);
+    await this._executePrompt(userMessageContent, 'task', clampedLevel, false, trimmedText);
   }
 
   private async _handleNeedMoreHelp(hintLevel?: number) {
@@ -719,7 +935,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       userMessageContent = `${contextBlock}\n\nLearner Question:\n${taskText}\n\n${hintLevelLabel}`;
     }
 
-    await this._executePrompt(userMessageContent, 'task', clampedLevel);
+    const hintName = getHintName(clampedLevel);
+    await this._executePrompt(
+      userMessageContent,
+      'task',
+      clampedLevel,
+      false,
+      `Need more help (${hintName} ${clampedLevel})`
+    );
   }
 
   /**
@@ -731,22 +954,28 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
    * - Prevents duplicate requests while in flight.
    * - Maps all error codes to friendly strings without raw traces or leaked credentials.
    * - Retains last request payload to enable zero-retype retry.
+   * - Persists learner turns and mentor replies to persistent sessions (Requirements 1, 2, 3).
    */
   private async _executePrompt(
     userMessageContent: string,
     mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check',
     hintLevel: number,
-    isRetry: boolean = false
+    isRetry: boolean = false,
+    learnerVisibleText?: string
   ): Promise<void> {
     if (!this._view) {
       return;
     }
 
+    // Learner-visible representation (Requirement 2: exclude raw file contents/selections from storage)
+    const stagedUserText = (learnerVisibleText || userMessageContent).trim();
+
     // Cache the request parameters for seamless Retry (Requirement C.2)
     this._lastRequest = {
       content: userMessageContent,
       mode: mode,
-      hintLevel: hintLevel
+      hintLevel: hintLevel,
+      learnerVisibleText: stagedUserText
     };
 
     // Prevent double-sends (Requirement B.4)
@@ -784,13 +1013,50 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       loading: true
     });
 
+    const primaryModel = getResolvedModel();
+    let modelUsed = primaryModel;
+    let usedFallback = false;
+
     try {
-      const rawReply = await askMentor(
-        this._history,
-        this._currentConfig,
-        this._activeConfig,
-        this._currentAbortController.signal
-      );
+      let rawReply: string;
+      try {
+        rawReply = await askMentor(
+          this._history,
+          this._currentConfig,
+          this._activeConfig,
+          this._currentAbortController.signal,
+          primaryModel
+        );
+      } catch (primaryError: any) {
+        const status = primaryError?.status;
+        const msg = primaryError?.message || '';
+        const fallbackModel = getResolvedFallbackModel();
+
+        // Requirement 3: Check specific model-not-found 404 condition
+        const isModelNotFound = (status === 404) && (
+          (primaryModel && msg.toLowerCase().includes(primaryModel.toLowerCase())) ||
+          msg.toLowerCase().includes('not found for api version')
+        );
+
+        // Requirement 4: If main model returns model-not-found 404 and fallback is set, retry ONCE with fallback model
+        if (isModelNotFound && fallbackModel && fallbackModel !== primaryModel) {
+          logApiError(status, primaryModel, mode, primaryError);
+          logChannel.appendLine(`[${new Date().toISOString()}] INFO: Primary model "${primaryModel}" not found. Retrying once with fallback model "${fallbackModel}"...`);
+
+          usedFallback = true;
+          modelUsed = fallbackModel;
+
+          rawReply = await askMentor(
+            this._history,
+            this._currentConfig,
+            this._activeConfig,
+            this._currentAbortController.signal,
+            fallbackModel
+          );
+        } else {
+          throw primaryError;
+        }
+      }
 
       // Check for empty or unusable reply (Requirement C.1)
       if (!rawReply || rawReply.trim().length === 0) {
@@ -804,9 +1070,61 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       const structuredReply: MentorReply = parseMentorReply(rawReply);
 
-      // Persist learned concepts in globalState
+      // Requirement 4: Show small note in the reply if fallback model was used
+      if (usedFallback) {
+        const note = 'Used fallback model';
+        structuredReply.message = structuredReply.message
+          ? `${structuredReply.message}\n\n*(${note})*`
+          : note;
+      }
+
+      // Persist learned concepts in globalState (live replies only)
       if (Array.isArray(structuredReply.concept) && structuredReply.concept.length > 0) {
         await saveConcepts(structuredReply.concept, this._globalState);
+      }
+
+      // =======================================================================
+      // PERSISTENT SESSION STORAGE (Requirements 1, 2, 3)
+      // Save learner message and raw reply JSON to globalState session
+      // =======================================================================
+      try {
+        if (!this._activeSession) {
+          // Create new session automatically on first learner message
+          this._activeSession = createNewSession(
+            stagedUserText,
+            this._currentLevel,
+            this._currentTaskText
+          );
+          await setActiveSessionId(this._globalState, this._activeSession.id);
+        }
+
+        const storedMode = mode === 'task' ? 'chat' : mode;
+
+        if (!isRetry) {
+          this._activeSession.messages.push({
+            role: 'user',
+            text: stagedUserText,
+            mode: storedMode,
+            ts: new Date().toISOString()
+          });
+        }
+
+        this._activeSession.messages.push({
+          role: 'assistant',
+          text: rawReply,
+          mode: storedMode,
+          ts: new Date().toISOString()
+        });
+
+        this._activeSession.hintLevel = this._currentLevel;
+        this._activeSession.originalTask = this._currentTaskText;
+        this._activeSession.workspaceName = vscode.workspace.name || '';
+
+        // Autosave after every successful mentor reply (Requirement 3)
+        await saveSession(this._globalState, this._activeSession);
+      } catch (storageErr) {
+        // Storage errors must never disrupt the chat experience
+        console.error('Code Mentor: Failed to persist active session turn:', storageErr);
       }
 
       this._postMessageToWebview({
@@ -831,16 +1149,25 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       // =======================================================================
-      // FRIENDLY ERROR MAPPING (Requirement C.1)
+      // FRIENDLY ERROR MAPPING (Requirements 2 & 3)
       // Never expose raw stack traces, API keys, or full request payloads.
       // =======================================================================
+      const status = error?.status;
+      const msg = error?.message || '';
+
+      // Requirement 2: Log HTTP status, model used, mode, and first 300 chars of error body
+      logApiError(status, modelUsed, mode, error);
+
       let errorMessage = 'An unexpected error occurred. Please try again.';
       let errorAction: 'openSettings' | 'retry' | 'none' = 'none';
       let actionLabel = '';
       let retryCountdown = 0;
 
-      const status = error?.status;
-      const msg = error?.message || '';
+      // Requirement 3: Only show "model name not found" if status is 404 AND body mentions model name or "not found for API version"
+      const isModelNotFound = (status === 404) && (
+        (modelUsed && msg.toLowerCase().includes(modelUsed.toLowerCase())) ||
+        msg.toLowerCase().includes('not found for api version')
+      );
 
       if (error instanceof MissingApiKeyError) {
         errorMessage = 'Add your API key to get started.';
@@ -856,14 +1183,26 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         errorMessage = 'Your API key was rejected. Check that it is correct and has access to the model.';
         errorAction = 'openSettings';
         actionLabel = 'Open settings';
-      } else if (
-        status === 404 ||
-        msg.includes('models/') ||
-        (msg.includes('not found') && !msg.includes('API'))
-      ) {
+      } else if (isModelNotFound) {
         errorMessage = 'The model name in settings was not found.';
         errorAction = 'openSettings';
         actionLabel = 'Open settings';
+      } else if (status === 404) {
+        // Requirement 3: For any other 404, show "The AI service returned an error (404)" with short snippet and Retry button
+        let sanitizedSnippet = msg
+          .replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED]')
+          .replace(/AQ\.[0-9A-Za-z-_]{20,}/g, '[REDACTED]')
+          .replace(/sk-[0-9A-Za-z-_]{20,}/g, '[REDACTED]')
+          .replace(/key=[^&\s]+/gi, 'key=[REDACTED]')
+          .slice(0, 100)
+          .trim();
+        sanitizedSnippet = sanitizedSnippet.replace(/[:\-]+$/, '').trim();
+
+        errorMessage = sanitizedSnippet
+          ? `The AI service returned an error (404): ${sanitizedSnippet}`
+          : 'The AI service returned an error (404).';
+        errorAction = 'retry';
+        actionLabel = 'Retry';
       } else if (
         status === 429 ||
         msg.includes('429') ||
@@ -906,8 +1245,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         actionLabel = 'Retry';
       }
 
-      logError(`API call failed: ${errorMessage}`);
-
       // Remove last unanswered turn so chat history remains uncorrupted
       if (!isRetry && this._history.length > 0) {
         this._history.pop();
@@ -932,6 +1269,150 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         loading: false
       });
     }
+  }
+
+  /**
+   * Posts formatted session summaries to webview for the History view (Requirement 6).
+   */
+  private _postSessionsList(): void {
+    try {
+      const allSessions = getAllSessions(this._globalState);
+      const activeId = this._activeSession ? this._activeSession.id : null;
+      const formatted = allSessions.map(s => ({
+        id: s.id,
+        title: s.title,
+        relativeDate: formatRelativeDate(s.updatedAt || s.createdAt),
+        messageCount: s.messages.length,
+        concepts: extractSessionConcepts(s, 3),
+        isActive: s.id === activeId
+      }));
+
+      this._postMessageToWebview({
+        type: 'sessionsList',
+        sessions: formatted
+      });
+    } catch (err) {
+      console.error('Code Mentor: Failed to post sessions list:', err);
+    }
+  }
+
+  /**
+   * Posts the most recent previous session to the Welcome screen if current chat is empty (Requirement 7).
+   */
+  private _checkAndPostWelcomeContinueCard(): void {
+    try {
+      if (this._activeSession && this._activeSession.messages.length > 0) {
+        return;
+      }
+      const mostRecent = getMostRecentSession(this._globalState);
+      if (mostRecent) {
+        this._postMessageToWebview({
+          type: 'welcomeContinueCard',
+          session: {
+            id: mostRecent.id,
+            title: mostRecent.title,
+            relativeDate: formatRelativeDate(mostRecent.updatedAt || mostRecent.createdAt)
+          }
+        });
+      }
+    } catch (err) {
+      console.error('Code Mentor: Failed to check and post welcome continue card:', err);
+    }
+  }
+
+  /**
+   * Resumes a session by ID (Requirements 5 & 6).
+   */
+  public async resumeSessionById(sessionId: string): Promise<void> {
+    try {
+      // 1. Save current session if active and contains messages
+      if (this._activeSession && this._activeSession.messages.length > 0) {
+        await saveSession(this._globalState, this._activeSession);
+      }
+
+      // 2. Fetch targeted session
+      const session = getSessionById(this._globalState, sessionId);
+      if (!session) {
+        this._postMessageToWebview({
+          type: 'noticeMessage',
+          text: 'Selected session could not be found.'
+        });
+        return;
+      }
+
+      // 3. Mark as active session
+      this._activeSession = session;
+      await setActiveSessionId(this._globalState, session.id);
+
+      // 4. Restore in-memory state & clamp hint level with instructor config (Requirement 9)
+      const effectiveMax = this._currentConfig.maxHintLevel;
+      this._activeSession.hintLevel = Math.min(this._activeSession.hintLevel || 1, effectiveMax) as 1 | 2 | 3 | 4;
+      this._currentLevel = this._activeSession.hintLevel;
+      this._currentTaskText = this._activeSession.originalTask || '';
+
+      // Rebuild in-memory LLM history from session.messages (Requirement 5)
+      this._history = this._activeSession.messages.map(m => ({
+        role: m.role,
+        content: m.text
+      }));
+
+      // Restore mode
+      if (this._activeSession.messages.length > 0) {
+        const lastMode = this._activeSession.messages[this._activeSession.messages.length - 1].mode;
+        if (lastMode === 'explain' || lastMode === 'review' || lastMode === 'explain_back' || lastMode === 'paste_check') {
+          this._currentMode = lastMode;
+        } else {
+          this._currentMode = 'task';
+        }
+      } else {
+        this._currentMode = 'task';
+      }
+
+      // 5. Post restore message to webview
+      this._postMessageToWebview({
+        type: 'restore',
+        session: this._activeSession
+      });
+    } catch (err) {
+      console.error('Code Mentor: Failed to resume session by ID:', err);
+    }
+  }
+
+  /**
+   * Command: Resume last session (Requirement 8).
+   */
+  public async resumeLastSession(): Promise<void> {
+    if (!this._view || !this._isWebviewReady) {
+      this._pendingResumeLastSession = true;
+      return;
+    }
+
+    try {
+      const recent = getMostRecentSession(this._globalState);
+      if (recent) {
+        await this.resumeSessionById(recent.id);
+      } else {
+        this._postMessageToWebview({
+          type: 'noticeMessage',
+          text: 'No past sessions found to resume.'
+        });
+      }
+    } catch (err) {
+      console.error('Code Mentor: Failed to resume last session:', err);
+    }
+  }
+
+  /**
+   * Command: Show chat history (Requirement 8).
+   */
+  public async showHistory(): Promise<void> {
+    if (!this._view || !this._isWebviewReady) {
+      this._pendingShowHistory = true;
+      return;
+    }
+
+    this._postMessageToWebview({ type: 'openHistory' });
+    this._postSessionsList();
   }
 
   private _postMessageToWebview(message: any) {
@@ -2206,6 +2687,259 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       gap: 6px;
       font-size: 11px;
     }
+
+    /* History Panel (Requirement 6) */
+    .history-panel {
+      display: none;
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
+      border-radius: 6px;
+      padding: 12px;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .history-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-bottom: 4px;
+      border-bottom: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.15));
+    }
+
+    .history-title {
+      font-weight: 600;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .history-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+
+    .history-empty-msg {
+      font-style: italic;
+      font-size: 11.5px;
+      opacity: 0.75;
+      padding: 8px 0;
+    }
+
+    .history-item {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 10px;
+      border-radius: 4px;
+      background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.06));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.15));
+    }
+
+    .history-item.is-active {
+      border-color: var(--vscode-focusBorder);
+      background: var(--vscode-editor-selectionBackground, rgba(128, 128, 128, 0.12));
+    }
+
+    .history-item-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 6px;
+    }
+
+    .history-item-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+      word-break: break-word;
+      line-height: 1.35;
+    }
+
+    .badge-current {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      background: var(--vscode-badge-background, rgba(128, 128, 128, 0.3));
+      color: var(--vscode-badge-foreground, var(--vscode-foreground));
+      padding: 1px 6px;
+      border-radius: 8px;
+      flex-shrink: 0;
+    }
+
+    .history-item-meta {
+      font-size: 10.5px;
+      opacity: 0.75;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .history-item-concepts {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+      margin-top: 2px;
+    }
+
+    .history-concept-chip {
+      font-size: 10px;
+      background: var(--vscode-badge-background, rgba(128, 128, 128, 0.2));
+      color: var(--vscode-badge-foreground, inherit);
+      padding: 1px 6px;
+      border-radius: 10px;
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.2));
+    }
+
+    .history-item-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 6px;
+      margin-top: 4px;
+      flex-wrap: wrap;
+    }
+
+    .history-item-actions button {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .btn-resume-session {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+    }
+
+    .btn-resume-session:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+
+    .btn-delete-session {
+      background: transparent;
+      border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.25));
+      color: var(--vscode-foreground);
+    }
+
+    .btn-delete-session:hover {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.2));
+    }
+
+    .delete-confirm-inline {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+    }
+
+    .history-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      border-top: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.15));
+      padding-top: 8px;
+      flex-wrap: wrap;
+    }
+
+    .btn-back-chat,
+    .btn-clear-all {
+      background: transparent;
+      border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.25));
+      color: var(--vscode-foreground);
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+
+    .btn-back-chat:hover,
+    .btn-clear-all:hover {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.2));
+    }
+
+    .clear-all-confirm-box {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+    }
+
+    /* Continue Card on Welcome Screen (Requirement 7) */
+    .continue-card {
+      background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.1));
+      border: 1px solid var(--vscode-focusBorder, rgba(0, 122, 204, 0.4));
+      border-left: 3px solid var(--vscode-textLink-foreground, #007acc);
+      border-radius: 4px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .continue-card-header {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+
+    .continue-card-icon {
+      font-size: 14px;
+      line-height: 1;
+    }
+
+    .continue-card-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      font-size: 11.5px;
+      line-height: 1.35;
+    }
+
+    .continue-card-prefix {
+      font-size: 10.5px;
+      opacity: 0.75;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .continue-card-title {
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+
+    .continue-card-date {
+      font-size: 10.5px;
+      opacity: 0.7;
+    }
+
+    .continue-card-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 2px;
+    }
+
+    .continue-fresh-link {
+      color: var(--vscode-textLink-foreground);
+      text-decoration: none;
+      font-size: 11px;
+      cursor: pointer;
+    }
+
+    .continue-fresh-link:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
@@ -2217,6 +2951,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         <span>Code Mentor</span>
       </div>
       <div class="header-actions">
+        <button id="history-toggle-btn" title="View past chat sessions" aria-label="View chat history">📜 History</button>
         <button id="progress-toggle-btn" title="View your learned concepts" aria-label="View learning progress">📊 Progress</button>
         <button id="review-code-btn" title="Review my current active file" aria-label="Review active file">🔍 Review</button>
         <button id="new-task-btn" title="Clear conversation history and reset level to 1" aria-label="Start new task">+ New task</button>
@@ -2231,6 +2966,26 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
   <!-- Messages Container (Requirement D.3: role="log" and aria-live="polite") -->
   <div class="messages-container" id="messages-container" role="log" aria-live="polite">
+
+    <!-- History Panel Card (Requirement 6) -->
+    <div class="history-panel" id="history-panel" style="display: none;">
+      <div class="history-header">
+        <span class="history-title">📜 Chat History</span>
+        <button type="button" class="btn-close-panel" id="close-history-btn" aria-label="Close history panel">✕</button>
+      </div>
+      <div class="history-list" id="history-list">
+        <!-- Rendered dynamically -->
+      </div>
+      <div class="history-footer">
+        <button type="button" class="btn-back-chat" id="back-to-chat-btn" aria-label="Back to current chat">← Back to chat</button>
+        <div class="clear-all-confirm-box" id="clear-all-confirm-box" style="display: none;">
+          <span>Clear all history?</span>
+          <button type="button" class="btn-action danger" id="confirm-clear-all-btn">Yes, clear all</button>
+          <button type="button" class="cancel-btn" id="cancel-clear-all-btn">Cancel</button>
+        </div>
+        <button type="button" class="btn-clear-all" id="init-clear-all-btn">Clear all history</button>
+      </div>
+    </div>
 
     <!-- Progress Panel Card (Requirement F) -->
     <div class="progress-panel" id="progress-panel">
@@ -2256,6 +3011,23 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       <div id="welcome-normal-content">
         <h3>👋 Welcome to Code Mentor!</h3>
         <p class="welcome-tagline">I help you learn by guiding you, not by writing everything for you.</p>
+
+        <!-- Continue Card on Welcome Screen (Requirement 7) -->
+        <div class="continue-card" id="welcome-continue-card" style="display: none;">
+          <div class="continue-card-header">
+            <span class="continue-card-icon" aria-hidden="true">⏳</span>
+            <div class="continue-card-meta">
+              <span class="continue-card-prefix">Continue where you left off:</span>
+              <span class="continue-card-title" id="continue-card-title"></span>
+              <span class="continue-card-date" id="continue-card-date"></span>
+            </div>
+          </div>
+          <div class="continue-card-actions">
+            <button type="button" class="btn-action" id="continue-session-btn" aria-label="Continue previous session">Continue</button>
+            <a href="#" class="continue-fresh-link" id="continue-start-fresh-btn">Start fresh</a>
+          </div>
+        </div>
+
         <ul class="welcome-bullets" id="welcome-bullets">
           <li>Ask for a plan when starting a task</li>
           <li>Use the hint buttons when you're stuck</li>
@@ -2269,7 +3041,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             <button type="button" class="prompt-chip" data-prompt="Explain the code I selected">Explain the code I selected</button>
           </div>
         </div>
-        <div class="welcome-privacy">Your current file and selected code are sent to your AI provider to generate replies.</div>
+        <div class="welcome-privacy">Your current file and selected code are sent to your AI provider to generate replies. Your chat history is saved on this computer only, and you can delete it any time from History.</div>
       </div>
 
       <!-- Setup Box when no API Key is set (Requirement A.2) -->
@@ -2369,6 +3141,24 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     const resetConfirmBox = document.getElementById('reset-confirm-box');
     const confirmResetProgressBtn = document.getElementById('confirm-reset-progress-btn');
     const cancelResetProgressBtn = document.getElementById('cancel-reset-progress-btn');
+
+    // History elements (Requirement 6)
+    const historyToggleBtn = document.getElementById('history-toggle-btn');
+    const historyPanel = document.getElementById('history-panel');
+    const closeHistoryBtn = document.getElementById('close-history-btn');
+    const historyList = document.getElementById('history-list');
+    const backToChatBtn = document.getElementById('back-to-chat-btn');
+    const initClearAllBtn = document.getElementById('init-clear-all-btn');
+    const clearAllConfirmBox = document.getElementById('clear-all-confirm-box');
+    const confirmClearAllBtn = document.getElementById('confirm-clear-all-btn');
+    const cancelClearAllBtn = document.getElementById('cancel-clear-all-btn');
+
+    // Welcome Continue Card elements (Requirement 7)
+    const welcomeContinueCard = document.getElementById('welcome-continue-card');
+    const continueCardTitle = document.getElementById('continue-card-title');
+    const continueCardDate = document.getElementById('continue-card-date');
+    const continueSessionBtn = document.getElementById('continue-session-btn');
+    const continueStartFreshBtn = document.getElementById('continue-start-fresh-btn');
 
     // Course settings elements
     const courseBadgeRow = document.getElementById('course-badge-row');
@@ -2532,6 +3322,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       }
       hideSolutionConfirmation();
       selectHintLevel(level);
+      // Autosave on hint level change (Requirement 3)
+      vscode.postMessage({ type: 'hintLevelChanged', level: currentHintLevel });
     }
 
     [1, 2, 3, 4].forEach(function(lvl) {
@@ -2546,6 +3338,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       confirmStructureBtn.addEventListener('click', function() {
         hideSolutionConfirmation();
         selectHintLevel(3);
+        vscode.postMessage({ type: 'hintLevelChanged', level: 3 });
       });
     }
 
@@ -2553,6 +3346,207 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       confirmSolutionBtn.addEventListener('click', function() {
         hideSolutionConfirmation();
         selectHintLevel(4);
+        vscode.postMessage({ type: 'hintLevelChanged', level: 4 });
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // WELCOME CONTINUE CARD (Requirement 7)
+    // -------------------------------------------------------------------------
+    if (continueSessionBtn) {
+      continueSessionBtn.addEventListener('click', function() {
+        const id = welcomeContinueCard.getAttribute('data-session-id');
+        if (id) {
+          vscode.postMessage({ type: 'resumeSession', sessionId: id });
+        }
+      });
+    }
+
+    if (continueStartFreshBtn) {
+      continueStartFreshBtn.addEventListener('click', function(e) {
+        e.preventDefault();
+        welcomeContinueCard.style.display = 'none';
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // HISTORY VIEW (Requirement 6)
+    // -------------------------------------------------------------------------
+    if (historyToggleBtn) {
+      historyToggleBtn.addEventListener('click', function() {
+        const isVisible = (historyPanel.style.display === 'flex');
+        if (isVisible) {
+          historyPanel.style.display = 'none';
+        } else {
+          if (progressPanel) progressPanel.style.display = 'none';
+          historyPanel.style.display = 'flex';
+          vscode.postMessage({ type: 'getSessions' });
+        }
+      });
+    }
+
+    if (closeHistoryBtn) {
+      closeHistoryBtn.addEventListener('click', function() {
+        historyPanel.style.display = 'none';
+      });
+    }
+
+    if (backToChatBtn) {
+      backToChatBtn.addEventListener('click', function() {
+        historyPanel.style.display = 'none';
+      });
+    }
+
+    if (initClearAllBtn) {
+      initClearAllBtn.addEventListener('click', function() {
+        initClearAllBtn.style.display = 'none';
+        clearAllConfirmBox.style.display = 'flex';
+      });
+    }
+
+    if (cancelClearAllBtn) {
+      cancelClearAllBtn.addEventListener('click', function() {
+        clearAllConfirmBox.style.display = 'none';
+        initClearAllBtn.style.display = 'inline-block';
+      });
+    }
+
+    if (confirmClearAllBtn) {
+      confirmClearAllBtn.addEventListener('click', function() {
+        clearAllConfirmBox.style.display = 'none';
+        initClearAllBtn.style.display = 'inline-block';
+        vscode.postMessage({ type: 'clearAllSessions' });
+      });
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    function renderSessionsList(sessions) {
+      historyList.innerHTML = '';
+      if (!Array.isArray(sessions) || sessions.length === 0) {
+        const emptyEl = document.createElement('div');
+        emptyEl.className = 'history-empty-msg';
+        emptyEl.textContent = 'Your past sessions will appear here.';
+        historyList.appendChild(emptyEl);
+        return;
+      }
+
+      sessions.forEach(function(sess) {
+        const itemEl = document.createElement('div');
+        itemEl.className = 'history-item' + (sess.isActive ? ' is-active' : '');
+
+        const topRow = document.createElement('div');
+        topRow.className = 'history-item-top';
+
+        const titleEl = document.createElement('div');
+        titleEl.className = 'history-item-title';
+        titleEl.textContent = sess.title || 'Untitled session';
+        topRow.appendChild(titleEl);
+
+        if (sess.isActive) {
+          const currentBadge = document.createElement('span');
+          currentBadge.className = 'badge-current';
+          currentBadge.textContent = 'Current';
+          topRow.appendChild(currentBadge);
+        }
+
+        itemEl.appendChild(topRow);
+
+        const metaRow = document.createElement('div');
+        metaRow.className = 'history-item-meta';
+
+        const dateSpan = document.createElement('span');
+        dateSpan.textContent = sess.relativeDate || '';
+        metaRow.appendChild(dateSpan);
+
+        const dotSpan = document.createElement('span');
+        dotSpan.textContent = '·';
+        metaRow.appendChild(dotSpan);
+
+        const msgCountSpan = document.createElement('span');
+        msgCountSpan.textContent = sess.messageCount + ' message' + (sess.messageCount === 1 ? '' : 's');
+        metaRow.appendChild(msgCountSpan);
+
+        itemEl.appendChild(metaRow);
+
+        if (Array.isArray(sess.concepts) && sess.concepts.length > 0) {
+          const conceptsRow = document.createElement('div');
+          conceptsRow.className = 'history-item-concepts';
+          sess.concepts.forEach(function(c) {
+            const chip = document.createElement('span');
+            chip.className = 'history-concept-chip';
+            chip.textContent = c;
+            conceptsRow.appendChild(chip);
+          });
+          itemEl.appendChild(conceptsRow);
+        }
+
+        const actionsRow = document.createElement('div');
+        actionsRow.className = 'history-item-actions';
+
+        if (!sess.isActive) {
+          const resumeBtn = document.createElement('button');
+          resumeBtn.type = 'button';
+          resumeBtn.className = 'btn-resume-session';
+          resumeBtn.textContent = 'Resume';
+          resumeBtn.setAttribute('aria-label', 'Resume session: ' + (sess.title || 'Untitled session'));
+          resumeBtn.addEventListener('click', function() {
+            vscode.postMessage({ type: 'resumeSession', sessionId: sess.id });
+          });
+          actionsRow.appendChild(resumeBtn);
+        }
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.type = 'button';
+        deleteBtn.className = 'btn-delete-session';
+        deleteBtn.textContent = 'Delete';
+        deleteBtn.setAttribute('aria-label', 'Delete session: ' + (sess.title || 'Untitled session'));
+
+        const inlineConfirm = document.createElement('span');
+        inlineConfirm.className = 'delete-confirm-inline';
+        inlineConfirm.style.display = 'none';
+
+        const promptText = document.createElement('span');
+        promptText.textContent = 'Delete? ';
+        inlineConfirm.appendChild(promptText);
+
+        const yesBtn = document.createElement('button');
+        yesBtn.type = 'button';
+        yesBtn.className = 'btn-action danger';
+        yesBtn.textContent = 'Yes';
+        yesBtn.addEventListener('click', function() {
+          vscode.postMessage({ type: 'deleteSession', sessionId: sess.id });
+        });
+        inlineConfirm.appendChild(yesBtn);
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'cancel-btn';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.addEventListener('click', function() {
+          inlineConfirm.style.display = 'none';
+          deleteBtn.style.display = 'inline-block';
+        });
+        inlineConfirm.appendChild(cancelBtn);
+
+        deleteBtn.addEventListener('click', function() {
+          deleteBtn.style.display = 'none';
+          inlineConfirm.style.display = 'inline-flex';
+        });
+
+        actionsRow.appendChild(deleteBtn);
+        actionsRow.appendChild(inlineConfirm);
+
+        itemEl.appendChild(actionsRow);
+        historyList.appendChild(itemEl);
       });
     }
 
@@ -2565,6 +3559,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         if (isVisible) {
           progressPanel.style.display = 'none';
         } else {
+          if (historyPanel) historyPanel.style.display = 'none';
           progressPanel.style.display = 'flex';
           vscode.postMessage({ type: 'getConcepts' });
         }
@@ -2842,12 +3837,19 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         case 'taskReset':
         case 'historyCleared': {
           messagesContainer.innerHTML = '';
+          if (historyPanel) {
+            historyPanel.style.display = 'none';
+            messagesContainer.appendChild(historyPanel);
+          }
           if (progressPanel) {
             progressPanel.style.display = 'none';
             messagesContainer.appendChild(progressPanel);
           }
           if (welcomeCard) {
             welcomeCard.style.display = 'flex';
+            if (welcomeContinueCard) {
+              welcomeContinueCard.style.display = 'none';
+            }
             messagesContainer.appendChild(welcomeCard);
             updateWelcomeCardUI();
           }
@@ -2872,6 +3874,89 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           if (submitExplainBtn) {
             submitExplainBtn.disabled = true;
           }
+          break;
+        }
+
+        case 'restore': {
+          // Requirement 5: Rebuild chat using live renderers
+          const session = message.session;
+          if (!session) break;
+
+          if (historyPanel) historyPanel.style.display = 'none';
+          if (progressPanel) progressPanel.style.display = 'none';
+
+          // Clear existing messages from UI
+          const rows = messagesContainer.querySelectorAll('.message-row, .cancelled-note, .notice-card');
+          rows.forEach(function(r) { r.remove(); });
+
+          if (welcomeCard) {
+            welcomeCard.style.display = 'none';
+          }
+
+          // Restore hint level buttons
+          selectHintLevel(session.hintLevel || 1);
+
+          // Rebuild chat with the SAME card renderers used for live replies
+          if (Array.isArray(session.messages)) {
+            session.messages.forEach(function(msg) {
+              if (msg.role === 'user') {
+                appendUserMessage(msg.text);
+              } else if (msg.role === 'assistant') {
+                let parsed;
+                try {
+                  parsed = JSON.parse(msg.text);
+                } catch (e) {
+                  // Fallback if stored reply fails to parse
+                  parsed = {
+                    message: msg.text || '',
+                    concept: [],
+                    next_step: '',
+                    question: null,
+                    hint_level: session.hintLevel || 1
+                  };
+                }
+                const renderMode = msg.mode === 'chat' ? 'task' : msg.mode;
+                renderMentorReplyCard(parsed, renderMode);
+              }
+            });
+          }
+
+          hasReplies = Array.isArray(session.messages) && session.messages.some(function(m) { return m.role === 'assistant'; });
+          if (hasReplies && explainBackSection) {
+            explainBackSection.style.display = 'block';
+          }
+
+          // Scroll to newest message after restoring (Requirement 5)
+          scrollToBottom(true);
+          break;
+        }
+
+        case 'sessionsList': {
+          // Requirement 6: Render history rows
+          renderSessionsList(message.sessions);
+          break;
+        }
+
+        case 'welcomeContinueCard': {
+          // Requirement 7: Show continue card on welcome screen if chat is empty
+          const session = message.session;
+          if (session && welcomeContinueCard && welcomeCard && !hasReplies) {
+            if (continueCardTitle) {
+              continueCardTitle.textContent = session.title || 'Untitled session';
+            }
+            if (continueCardDate) {
+              continueCardDate.textContent = session.relativeDate ? ' · ' + session.relativeDate : '';
+            }
+            welcomeContinueCard.setAttribute('data-session-id', session.id);
+            welcomeContinueCard.style.display = 'block';
+          }
+          break;
+        }
+
+        case 'openHistory': {
+          // Requirement 6 & 8: Open history panel from command or header
+          if (progressPanel) progressPanel.style.display = 'none';
+          if (historyPanel) historyPanel.style.display = 'flex';
           break;
         }
 
@@ -3457,6 +4542,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           needHelpBtn.addEventListener('click', function() {
             needHelpBtn.disabled = true;
             selectHintLevel(nextLevel);
+            vscode.postMessage({
+              type: 'hintLevelChanged',
+              level: nextLevel
+            });
             appendUserMessage('Need more help (' + getHintName(nextLevel) + ' ' + nextLevel + ')');
             vscode.postMessage({
               type: 'needMoreHelp',

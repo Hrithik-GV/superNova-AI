@@ -33,7 +33,9 @@
     "onCommand:mentor.reviewFile",
     "onCommand:mentor.createConfig",
     "onCommand:mentor.testConnection",
-    "onCommand:mentor.showLogs"
+    "onCommand:mentor.showLogs",
+    "onCommand:mentor.resumeLastSession",
+    "onCommand:mentor.showHistory"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -79,6 +81,14 @@
       {
         "command": "mentor.showLogs",
         "title": "Mentor: Show Logs"
+      },
+      {
+        "command": "mentor.resumeLastSession",
+        "title": "Mentor: Resume Last Session"
+      },
+      {
+        "command": "mentor.showHistory",
+        "title": "Mentor: Show Chat History"
       }
     ],
     "menus": {
@@ -102,6 +112,11 @@
           "type": "string",
           "default": "gemini-3.5-flash-lite",
           "description": "Gemini model to use for mentoring (e.g. gemini-3.5-flash-lite, gemini-flash-lite-latest, gemini-3.8-flash)."
+        },
+        "mentor.fallbackModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional fallback Gemini model if the primary model is not found (e.g. gemini-3.5-flash-lite, gemini-flash-lite-latest)."
         }
       }
     }

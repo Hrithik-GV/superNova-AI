@@ -228,7 +228,7 @@ export function parseMentorReply(raw: string): MentorReply {
     if (Array.isArray(parsed.gaps)) {
       const items = parsed.gaps
         .filter((item: any) => typeof item === 'string' && item.trim().length > 0)
-        .map((item: string) => item.trim());
+        .map((item: string) => item.trim());``
       if (items.length > 0) {
         gaps = items;
       }
@@ -254,20 +254,74 @@ export function parseMentorReply(raw: string): MentorReply {
 }
 
 /**
+ * Default Gemini model constant used when mentor.model is empty or unconfigured.
+ */
+export const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
+
+/**
+ * =============================================================================
+ * UNIFIED MODEL RESOLUTION (Requirement 1 & 4)
+ * =============================================================================
+ * Reads the model from the "mentor.model" setting each time, trims surrounding
+ * whitespace, strips a leading "models/" if present, and falls back to a single
+ * DEFAULT_MODEL constant when empty.
+ *
+ * @param modelOverride - Optional explicit model override (e.g. for fallback retry)
+ * @returns Clean model identifier ready for the Google Generative AI SDK
+ */
+export function getResolvedModel(modelOverride?: string): string {
+  if (modelOverride && typeof modelOverride === 'string') {
+    let override = modelOverride.trim();
+    if (override.startsWith('models/')) {
+      override = override.substring('models/'.length).trim();
+    }
+    if (override) {
+      return override;
+    }
+  }
+
+  const vsConfig = vscode.workspace.getConfiguration('mentor');
+  const raw = vsConfig.get<string>('model', '');
+  let model = (raw || '').trim();
+  if (model.startsWith('models/')) {
+    model = model.substring('models/'.length).trim();
+  }
+  return model || DEFAULT_MODEL;
+}
+
+/**
+ * Resolves the optional fallback model from the "mentor.fallbackModel" setting.
+ * Trims whitespace and strips a leading "models/" prefix if present.
+ * Returns an empty string if not configured.
+ */
+export function getResolvedFallbackModel(): string {
+  const vsConfig = vscode.workspace.getConfiguration('mentor');
+  const raw = vsConfig.get<string>('fallbackModel', '');
+  let model = (raw || '').trim();
+  if (model.startsWith('models/')) {
+    model = model.substring('models/'.length).trim();
+  }
+  return model;
+}
+
+/**
  * Sends conversation history to Google Gemini asking explicitly for JSON output.
- * Reads API key dynamically from settings and dynamically builds the system prompt
- * from the active instructor config (.mentor.json).
+ * Reads API key dynamically from settings, resolves model via getResolvedModel,
+ * and dynamically builds the system prompt from the active instructor config (.mentor.json).
  */
 export async function askMentor(
   history: ChatMessage[],
   config?: MentorConfig,
   activeConfig?: boolean,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  modelOverride?: string
 ): Promise<string> {
-  // Read API key and model from VS Code configuration
+  // Read API key from VS Code configuration
   const vsConfig = vscode.workspace.getConfiguration('mentor');
   const apiKey = (vsConfig.get<string>('apiKey', '') || vsConfig.get<string>('apikey', '')).trim();
-  const modelName = vsConfig.get<string>('model', 'gemini-3.5-flash-lite').trim() || 'gemini-3.5-flash-lite';
+
+  // Unified model resolution through getResolvedModel
+  const modelName = getResolvedModel(modelOverride);
 
   if (!apiKey) {
     throw new MissingApiKeyError('No Gemini API key found. Please configure "mentor.apiKey" in your settings.');
@@ -289,11 +343,13 @@ export async function askMentor(
   });
 
   // Convert ChatMessage history to Gemini's Content format
-  // Gemini expects 'user' and 'model' as roles
-  const contents = history.map(msg => ({
-    role: msg.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: msg.content }]
-  }));
+  // Gemini expects 'user' and 'model' as roles; ensure non-empty parts
+  const contents = history
+    .filter(msg => msg && typeof msg.content === 'string' && msg.content.trim().length > 0)
+    .map(msg => ({
+      role: msg.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: msg.content }]
+    }));
 
   // Request structured JSON response from Gemini with optional abortSignal
   const requestOptions: any = {};
@@ -318,23 +374,25 @@ export async function askMentor(
  * Tests the Gemini API connection with a minimal request ("reply with OK").
  * Does not expose the API key or secret data in error strings.
  *
- * @returns Result object with success flag and sanitized error message if failed.
+ * @returns Result object with success flag, model used, and sanitized error message if failed.
  */
-export async function testApiConnection(): Promise<{ success: boolean; message: string }> {
+export async function testApiConnection(): Promise<{ success: boolean; message: string; modelUsed: string; status?: number; errorBody?: string }> {
   const vsConfig = vscode.workspace.getConfiguration('mentor');
   const apiKey = (vsConfig.get<string>('apiKey', '') || vsConfig.get<string>('apikey', '')).trim();
-  const modelName = vsConfig.get<string>('model', 'gemini-3.5-flash-lite').trim() || 'gemini-3.5-flash-lite';
+  const primaryModel = getResolvedModel();
+  const fallbackModel = getResolvedFallbackModel();
 
   if (!apiKey) {
     return {
       success: false,
-      message: 'No API key configured. Please set your Gemini API key in settings.'
+      message: 'No API key configured. Please set your Gemini API key in settings.',
+      modelUsed: primaryModel
     };
   }
 
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: modelName });
+    const model = genAI.getGenerativeModel({ model: primaryModel });
     const result = await model.generateContent(
       'Reply with OK',
       { timeout: 15000 }
@@ -343,29 +401,75 @@ export async function testApiConnection(): Promise<{ success: boolean; message: 
     if (text && text.trim().length > 0) {
       return {
         success: true,
-        message: `Successfully connected to ${modelName}!`
+        message: `Successfully connected to ${primaryModel}!`,
+        modelUsed: primaryModel
       };
     }
     return {
       success: false,
-      message: 'Connection succeeded but received an empty response.'
+      message: 'Connection succeeded but received an empty response.',
+      modelUsed: primaryModel
     };
   } catch (err: any) {
+    const status = err?.status;
+    const errBody = err?.message || '';
+
+    // Requirement 3: Check specific model-not-found condition
+    const isModelNotFound = (status === 404) && (
+      (primaryModel && errBody.toLowerCase().includes(primaryModel.toLowerCase())) ||
+      errBody.toLowerCase().includes('not found for api version')
+    );
+
+    // Requirement 4: If model not found and fallback is set, test fallback once
+    if (isModelNotFound && fallbackModel && fallbackModel !== primaryModel) {
+      try {
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const fallback = genAI.getGenerativeModel({ model: fallbackModel });
+        const result = await fallback.generateContent(
+          'Reply with OK',
+          { timeout: 15000 }
+        );
+        const text = result.response.text();
+        if (text && text.trim().length > 0) {
+          return {
+            success: true,
+            message: `Primary model "${primaryModel}" was not found, but fallback model "${fallbackModel}" connected successfully!`,
+            modelUsed: fallbackModel
+          };
+        }
+      } catch {
+        // Fallback also failed; proceed to report error
+      }
+    }
+
     let msg = 'Failed to connect to Google Gemini API.';
-    if (err?.status === 400 || err?.status === 401 || err?.status === 403) {
+    if (status === 400 || status === 401 || status === 403) {
       msg = 'API key was rejected. Check that your key is correct and active.';
-    } else if (err?.status === 404 || err?.message?.includes('not found')) {
-      msg = `Model "${modelName}" was not found. Check the "mentor.model" setting.`;
-    } else if (err?.status === 429) {
+    } else if (isModelNotFound) {
+      msg = `Model "${primaryModel}" was not found. Check the "mentor.model" setting.`;
+    } else if (status === 404) {
+      // For any other 404, show short snippet of the body
+      let snippet = errBody
+        .replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED]')
+        .replace(/AQ\.[0-9A-Za-z-_]{20,}/g, '[REDACTED]')
+        .replace(/key=[^&\s]+/gi, 'key=[REDACTED]')
+        .slice(0, 100)
+        .trim();
+      snippet = snippet.replace(/[:\-]+$/, '').trim();
+      msg = `The AI service returned an error (404)${snippet ? ': ' + snippet : '.'}`;
+    } else if (status === 429) {
       msg = 'Rate limit reached or quota exceeded.';
-    } else if (err?.message?.includes('fetch failed') || err?.code === 'ENOTFOUND') {
+    } else if (errBody.includes('fetch failed') || err?.code === 'ENOTFOUND') {
       msg = 'Network connection failed. Check your internet connection.';
-    } else if (err?.message) {
-      msg = err.message;
+    } else if (errBody) {
+      msg = errBody;
     }
     return {
       success: false,
-      message: msg
+      message: msg,
+      modelUsed: primaryModel,
+      status,
+      errorBody: errBody
     };
   }
 }
