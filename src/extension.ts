@@ -2485,12 +2485,39 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       overflow: hidden;
     }
 
-    /* Accessibility focus outlines */
+    /* Views visibility manager (Requirement 1) */
+    [hidden] {
+      display: none !important;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border-width: 0;
+    }
+
+    /* Accessibility focus outlines (Requirement 4) */
     button:focus-visible,
     textarea:focus-visible,
-    summary:focus-visible {
+    summary:focus-visible,
+    .quiz-option:focus-visible,
+    [tabindex="-1"]:focus-visible {
       outline: 1px solid var(--vscode-focusBorder);
       outline-offset: 1px;
+    }
+
+    @media (forced-colors: active) {
+      button:focus-visible,
+      textarea:focus-visible,
+      .quiz-option:focus-visible {
+        outline: 2px solid Highlight;
+      }
     }
 
     /* Header Bar */
@@ -2547,6 +2574,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25));
     }
 
+    .header-actions button.active,
+    .header-actions button[aria-pressed="true"] {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border-color: var(--vscode-focusBorder, var(--vscode-button-background));
+      font-weight: 600;
+    }
+
     .course-badge-row {
       display: none;
     }
@@ -2569,9 +2604,69 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       white-space: nowrap;
     }
 
+    /* Views (Chat, History, Progress) Layout (Requirement 1 & 5) */
+    .view-panel {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+    }
+
+    .view-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.15));
+      flex-shrink: 0;
+    }
+
+    .view-header-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .view-title {
+      font-weight: 600;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin: 0;
+      color: var(--vscode-foreground);
+    }
+
+    .view-title:focus {
+      outline: none;
+    }
+
+    .btn-back-chat {
+      background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.15));
+      color: var(--vscode-button-secondaryForeground, inherit);
+      border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.2));
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 500;
+      padding: 3px 8px;
+      border-radius: 3px;
+      font-family: inherit;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
+      transition: background 0.15s ease;
+    }
+
+    .btn-back-chat:hover {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25));
+    }
+
     /* Messages List */
     .messages-container {
       flex: 1;
+      min-height: 0;
       overflow-y: auto;
       padding: 12px;
       display: flex;
@@ -3707,12 +3802,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       cursor: not-allowed;
     }
 
-    /* Progress Panel (Requirement F) */
+    /* Progress Panel (Requirement F & View Switching) */
     .progress-panel {
-      display: none;
-      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
-      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
-      border-radius: 6px;
+      background: transparent;
+      border: none;
       padding: 12px;
       flex-direction: column;
       gap: 10px;
@@ -3736,8 +3829,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       display: flex;
       flex-direction: column;
       gap: 6px;
-      max-height: 200px;
-      overflow-y: auto;
+      flex: 1;
+      min-height: 0;
     }
 
     .progress-item {
@@ -3748,6 +3841,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       border-radius: 3px;
       background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.06));
       font-size: 11.5px;
+      gap: 6px;
     }
 
     .progress-item-name {
@@ -3758,8 +3852,24 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       gap: 8px;
-      opacity: 0.75;
+      opacity: 0.85;
       font-size: 10.5px;
+      flex-shrink: 0;
+    }
+
+    .btn-practice-concept {
+      background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.15));
+      border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.2));
+      color: var(--vscode-textLink-foreground, var(--vscode-button-secondaryForeground));
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .btn-practice-concept:hover {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25));
     }
 
     .progress-empty-msg {
@@ -3799,12 +3909,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       font-size: 11px;
     }
 
-    /* History Panel (Requirement 6) */
+    /* History Panel (Requirement 6 & View Switching) */
     .history-panel {
-      display: none;
-      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
-      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
-      border-radius: 6px;
+      background: transparent;
+      border: none;
       padding: 12px;
       flex-direction: column;
       gap: 10px;
@@ -3830,8 +3938,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       display: flex;
       flex-direction: column;
       gap: 8px;
-      max-height: 320px;
-      overflow-y: auto;
+      flex: 1;
+      min-height: 0;
     }
 
     .history-empty-msg {
@@ -4373,8 +4481,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         <span>Code Mentor</span>
       </div>
       <div class="header-actions">
-        <button id="history-toggle-btn" title="View past chat sessions" aria-label="View chat history">📜 History</button>
-        <button id="progress-toggle-btn" title="View your learned concepts" aria-label="View learning progress">📊 Progress</button>
+        <button id="history-toggle-btn" title="View past chat sessions" aria-label="View chat history" aria-pressed="false">📜 History</button>
+        <button id="progress-toggle-btn" title="View your learned concepts" aria-label="View learning progress" aria-pressed="false">📊 Progress</button>
         <button id="plan-first-btn" title="Outline your plan before writing code" aria-label="Plan it first">📋 Plan it first</button>
         <button id="review-structure-btn" title="Mentor: Review Project Structure" aria-label="Review project structure">🏗️ Structure</button>
         <button id="review-code-btn" title="Review my current active file" aria-label="Review active file">🔍 Review</button>
@@ -4389,47 +4497,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </div>
 
-  <!-- Messages Container (Requirement D.3: role="log" and aria-live="polite") -->
-  <div class="messages-container" id="messages-container" role="log" aria-live="polite">
+  <!-- Views (Chat, History, Progress) Layout (Requirement 1 & 5) -->
 
-    <!-- History Panel Card (Requirement 6) -->
-    <div class="history-panel" id="history-panel" style="display: none;">
-      <div class="history-header">
-        <span class="history-title">📜 Chat History</span>
-        <button type="button" class="btn-close-panel" id="close-history-btn" aria-label="Close history panel">✕</button>
-      </div>
-      <div class="history-list" id="history-list">
-        <!-- Rendered dynamically -->
-      </div>
-      <div class="history-footer">
-        <button type="button" class="btn-back-chat" id="back-to-chat-btn" aria-label="Back to current chat">← Back to chat</button>
-        <div class="clear-all-confirm-box" id="clear-all-confirm-box" style="display: none;">
-          <span>Clear all history?</span>
-          <button type="button" class="btn-action danger" id="confirm-clear-all-btn">Yes, clear all</button>
-          <button type="button" class="cancel-btn" id="cancel-clear-all-btn">Cancel</button>
-        </div>
-        <button type="button" class="btn-clear-all" id="init-clear-all-btn">Clear all history</button>
-      </div>
-    </div>
-
-    <!-- Progress Panel Card (Requirement F) -->
-    <div class="progress-panel" id="progress-panel">
-      <div class="progress-header">
-        <span class="progress-title">📊 Concepts Progress</span>
-        <button type="button" class="btn-close-panel" id="close-progress-btn" aria-label="Close progress panel">✕</button>
-      </div>
-      <div class="progress-list" id="progress-list">
-        <!-- Rendered dynamically -->
-      </div>
-      <div class="progress-footer">
-        <div class="reset-confirm-box" id="reset-confirm-box">
-          <span>Clear all?</span>
-          <button type="button" class="btn-action" id="confirm-reset-progress-btn">Yes, reset</button>
-          <button type="button" class="cancel-btn" id="cancel-reset-progress-btn">Cancel</button>
-        </div>
-        <button type="button" class="btn-reset-progress" id="init-reset-progress-btn">Reset progress</button>
-      </div>
-    </div>
+  <!-- Chat View Container (Messages Container) -->
+  <div class="messages-container view-panel" id="messages-container" role="log" aria-live="polite">
 
     <!-- Onboarding / Welcome Card (Requirement A) -->
     <div class="welcome-card" id="welcome-card">
@@ -4480,6 +4551,54 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
   </div>
 
+  <!-- History View Panel (Sibling of Chat View, Requirement 1) -->
+  <div class="history-panel view-panel" id="history-panel" hidden>
+    <div class="view-header history-header">
+      <div class="view-header-left">
+        <button type="button" class="btn-back-chat" id="history-top-back-btn" aria-label="Back to chat">← Back to chat</button>
+        <h2 class="view-title history-title" id="history-heading" tabindex="-1">📜 Chat History</h2>
+      </div>
+      <button type="button" class="btn-close-panel" id="close-history-btn" title="Back to chat" aria-label="Close history view">✕</button>
+    </div>
+    <div class="history-list" id="history-list">
+      <!-- Rendered dynamically -->
+    </div>
+    <div class="history-footer">
+      <button type="button" class="btn-back-chat" id="back-to-chat-btn" aria-label="Back to current chat">← Back to chat</button>
+      <div class="clear-all-confirm-box" id="clear-all-confirm-box" style="display: none;">
+        <span>Clear all history?</span>
+        <button type="button" class="btn-action danger" id="confirm-clear-all-btn">Yes, clear all</button>
+        <button type="button" class="cancel-btn" id="cancel-clear-all-btn">Cancel</button>
+      </div>
+      <button type="button" class="btn-clear-all" id="init-clear-all-btn">Clear all history</button>
+    </div>
+  </div>
+
+  <!-- Progress View Panel (Sibling of Chat View, Requirement 1) -->
+  <div class="progress-panel view-panel" id="progress-panel" hidden>
+    <div class="view-header progress-header">
+      <div class="view-header-left">
+        <button type="button" class="btn-back-chat" id="progress-top-back-btn" aria-label="Back to chat">← Back to chat</button>
+        <h2 class="view-title progress-title" id="progress-heading" tabindex="-1">📊 Concepts Progress</h2>
+      </div>
+      <button type="button" class="btn-close-panel" id="close-progress-btn" title="Back to chat" aria-label="Close progress view">✕</button>
+    </div>
+    <div class="progress-list" id="progress-list">
+      <!-- Rendered dynamically -->
+    </div>
+    <div class="progress-footer">
+      <div class="reset-confirm-box" id="reset-confirm-box">
+        <span>Clear all?</span>
+        <button type="button" class="btn-action" id="confirm-reset-progress-btn">Yes, reset</button>
+        <button type="button" class="cancel-btn" id="cancel-reset-progress-btn">Cancel</button>
+      </div>
+      <button type="button" class="btn-reset-progress" id="init-reset-progress-btn">Reset progress</button>
+    </div>
+  </div>
+
+  <!-- Announcer for view accessibility (Requirement 4) -->
+  <div id="view-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
   <!-- Loading & Cancel Indicator (Requirement B.1 & B.2) -->
   <div class="loading-row" id="loading-row">
     <div class="loading-text-group">
@@ -4494,7 +4613,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   </div>
 
   <!-- Chat Footer -->
-  <div class="chat-footer">
+  <div class="chat-footer" id="chat-footer">
     <!-- Plan First Inline Panel (Requirement A.1) -->
     <div class="plan-first-panel" id="plan-first-panel" style="display: none;">
       <div class="plan-first-panel-header">
@@ -4581,20 +4700,28 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     const planCharCount = document.getElementById('plan-char-count');
     const submitPlanBtn = document.getElementById('submit-plan-btn');
 
+    // Layout & View Switching Elements (Requirement 1, 4 & 5)
+    const chatFooter = document.getElementById('chat-footer');
+    const viewAnnouncer = document.getElementById('view-announcer');
+
     // Progress elements
     const progressToggleBtn = document.getElementById('progress-toggle-btn');
     const progressPanel = document.getElementById('progress-panel');
     const closeProgressBtn = document.getElementById('close-progress-btn');
+    const progressTopBackBtn = document.getElementById('progress-top-back-btn');
+    const progressHeading = document.getElementById('progress-heading');
     const progressList = document.getElementById('progress-list');
     const initResetProgressBtn = document.getElementById('init-reset-progress-btn');
     const resetConfirmBox = document.getElementById('reset-confirm-box');
     const confirmResetProgressBtn = document.getElementById('confirm-reset-progress-btn');
     const cancelResetProgressBtn = document.getElementById('cancel-reset-progress-btn');
 
-    // History elements (Requirement 6)
+    // History elements (Requirement 6 & View Switching)
     const historyToggleBtn = document.getElementById('history-toggle-btn');
     const historyPanel = document.getElementById('history-panel');
     const closeHistoryBtn = document.getElementById('close-history-btn');
+    const historyTopBackBtn = document.getElementById('history-top-back-btn');
+    const historyHeading = document.getElementById('history-heading');
     const historyList = document.getElementById('history-list');
     const backToChatBtn = document.getElementById('back-to-chat-btn');
     const initClearAllBtn = document.getElementById('init-clear-all-btn');
@@ -4641,6 +4768,154 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     let hasApiKey = false;
     let isOnboarded = false;
     let hasReplies = false;
+
+    // View state & scroll preservation (Requirement 1 & 2)
+    let currentView = 'chat';
+    let savedChatScrollTop = 0;
+    let savedChatWasAtBottom = true;
+
+    function announceLive(message) {
+      if (!viewAnnouncer) return;
+      viewAnnouncer.textContent = '';
+      setTimeout(function() {
+        viewAnnouncer.textContent = message;
+      }, 50);
+    }
+
+    function scrollAndFocusInline(element, focusTarget) {
+      if (!element) return;
+      const prefersReduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const behavior = prefersReduced ? 'auto' : 'smooth';
+      try {
+        element.scrollIntoView({
+          behavior: behavior,
+          block: 'nearest'
+        });
+      } catch {
+        element.scrollIntoView(false);
+      }
+      if (focusTarget) {
+        try {
+          focusTarget.focus({ preventScroll: true });
+        } catch {
+          focusTarget.focus();
+        }
+      }
+    }
+
+    function showView(viewName) {
+      if (viewName !== 'chat' && viewName !== 'history' && viewName !== 'progress') {
+        viewName = 'chat';
+      }
+
+      if (currentView === viewName) {
+        return;
+      }
+
+      // 1. If leaving chat view, save scroll position and bottom state (Requirement 2)
+      if (currentView === 'chat' && messagesContainer) {
+        // TEST NOTE: Save chat scroll position before leaving chat view
+        // Record scrollTop and whether user was within 40px of bottom
+        const threshold = 40;
+        const isAtBottom = (messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight) <= threshold;
+        savedChatScrollTop = messagesContainer.scrollTop;
+        savedChatWasAtBottom = isAtBottom;
+      }
+
+      currentView = viewName;
+
+      // 2. Update view visibility using hidden attribute (Requirement 1)
+      if (messagesContainer) {
+        if (viewName === 'chat') {
+          messagesContainer.removeAttribute('hidden');
+        } else {
+          messagesContainer.setAttribute('hidden', '');
+        }
+      }
+
+      if (historyPanel) {
+        if (viewName === 'history') {
+          historyPanel.removeAttribute('hidden');
+          // TEST NOTE: Non-chat view scrollTop is reset to 0 every time it opens (Requirement 1)
+          historyPanel.scrollTop = 0;
+        } else {
+          historyPanel.setAttribute('hidden', '');
+        }
+      }
+
+      if (progressPanel) {
+        if (viewName === 'progress') {
+          progressPanel.removeAttribute('hidden');
+          // TEST NOTE: Non-chat view scrollTop is reset to 0 every time it opens (Requirement 1)
+          progressPanel.scrollTop = 0;
+        } else {
+          progressPanel.setAttribute('hidden', '');
+        }
+      }
+
+      // 3. Hide composer while in History or Progress view (Requirement 1)
+      if (chatFooter) {
+        if (viewName === 'chat') {
+          chatFooter.removeAttribute('hidden');
+        } else {
+          chatFooter.setAttribute('hidden', '');
+        }
+      }
+
+      // Hide loading row if not in chat view
+      if (loadingRow) {
+        if (viewName === 'chat' && isLoading) {
+          loadingRow.classList.add('visible');
+        } else {
+          loadingRow.classList.remove('visible');
+        }
+      }
+
+      // 4. Update aria-pressed and active classes on header buttons (Requirement 1)
+      if (historyToggleBtn) {
+        historyToggleBtn.setAttribute('aria-pressed', viewName === 'history' ? 'true' : 'false');
+        if (viewName === 'history') {
+          historyToggleBtn.classList.add('active');
+        } else {
+          historyToggleBtn.classList.remove('active');
+        }
+      }
+
+      if (progressToggleBtn) {
+        progressToggleBtn.setAttribute('aria-pressed', viewName === 'progress' ? 'true' : 'false');
+        if (viewName === 'progress') {
+          progressToggleBtn.classList.add('active');
+        } else {
+          progressToggleBtn.classList.remove('active');
+        }
+      }
+
+      // 5. Accessibility & Focus Management (Requirement 4)
+      if (viewName === 'history') {
+        if (historyHeading) {
+          historyHeading.focus({ preventScroll: true });
+        }
+        announceLive('History opened');
+      } else if (viewName === 'progress') {
+        if (progressHeading) {
+          progressHeading.focus({ preventScroll: true });
+        }
+        announceLive('Progress opened');
+      } else if (viewName === 'chat') {
+        // TEST NOTE: Restore chat scroll position upon returning to chat view (Requirement 2)
+        // If it was at the bottom (within 40px), scroll to the new bottom; otherwise restore saved scrollTop
+        if (savedChatWasAtBottom) {
+          messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        } else {
+          messagesContainer.scrollTop = savedChatScrollTop;
+        }
+
+        if (userInput) {
+          userInput.focus({ preventScroll: true });
+        }
+        announceLive('Chat opened');
+      }
+    }
 
     // Notify extension host that webview is ready
     vscode.postMessage({ type: 'ready' });
@@ -4819,16 +5094,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     // -------------------------------------------------------------------------
-    // HISTORY VIEW (Requirement 6)
+    // HISTORY VIEW (Requirement 6 & View Switching)
     // -------------------------------------------------------------------------
     if (historyToggleBtn) {
       historyToggleBtn.addEventListener('click', function() {
-        const isVisible = (historyPanel.style.display === 'flex');
-        if (isVisible) {
-          historyPanel.style.display = 'none';
+        if (currentView === 'history') {
+          showView('chat');
         } else {
-          if (progressPanel) progressPanel.style.display = 'none';
-          historyPanel.style.display = 'flex';
+          showView('history');
           vscode.postMessage({ type: 'getSessions' });
         }
       });
@@ -4836,13 +5109,19 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     if (closeHistoryBtn) {
       closeHistoryBtn.addEventListener('click', function() {
-        historyPanel.style.display = 'none';
+        showView('chat');
+      });
+    }
+
+    if (historyTopBackBtn) {
+      historyTopBackBtn.addEventListener('click', function() {
+        showView('chat');
       });
     }
 
     if (backToChatBtn) {
       backToChatBtn.addEventListener('click', function() {
-        historyPanel.style.display = 'none';
+        showView('chat');
       });
     }
 
@@ -4933,6 +5212,15 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             const chip = document.createElement('span');
             chip.className = 'history-concept-chip';
             chip.textContent = c;
+            chip.style.cursor = 'pointer';
+            chip.title = 'Practice on ' + c;
+            chip.setAttribute('aria-label', 'Practice on ' + c);
+            chip.addEventListener('click', function() {
+              showView('chat');
+              userInput.value = 'Can you give me a practice exercise on ' + c + '?';
+              userInput.focus({ preventScroll: true });
+              scrollToBottom(true);
+            });
             conceptsRow.appendChild(chip);
           });
           itemEl.appendChild(conceptsRow);
@@ -4948,6 +5236,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           resumeBtn.textContent = 'Resume';
           resumeBtn.setAttribute('aria-label', 'Resume session: ' + (sess.title || 'Untitled session'));
           resumeBtn.addEventListener('click', function() {
+            // Action finishes in chat (Requirement 2): switch view and scroll to bottom
+            showView('chat');
+            scrollToBottom(true);
             vscode.postMessage({ type: 'resumeSession', sessionId: sess.id });
           });
           actionsRow.appendChild(resumeBtn);
@@ -5000,16 +5291,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     // -------------------------------------------------------------------------
-    // PROGRESS PANEL (Requirement F)
+    // PROGRESS PANEL (Requirement F & View Switching)
     // -------------------------------------------------------------------------
     if (progressToggleBtn) {
       progressToggleBtn.addEventListener('click', function() {
-        const isVisible = (progressPanel.style.display === 'flex');
-        if (isVisible) {
-          progressPanel.style.display = 'none';
+        if (currentView === 'progress') {
+          showView('chat');
         } else {
-          if (historyPanel) historyPanel.style.display = 'none';
-          progressPanel.style.display = 'flex';
+          showView('progress');
           vscode.postMessage({ type: 'getConcepts' });
         }
       });
@@ -5017,7 +5306,13 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     if (closeProgressBtn) {
       closeProgressBtn.addEventListener('click', function() {
-        progressPanel.style.display = 'none';
+        showView('chat');
+      });
+    }
+
+    if (progressTopBackBtn) {
+      progressTopBackBtn.addEventListener('click', function() {
+        showView('chat');
       });
     }
 
@@ -5068,6 +5363,15 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
         const row = document.createElement('div');
         row.className = 'progress-item';
+        row.style.cursor = 'pointer';
+        row.title = 'Practice on ' + name;
+        row.addEventListener('click', function() {
+          // Action finishes in chat (Requirement 2): switch view and scroll to bottom
+          showView('chat');
+          userInput.value = 'Can you give me a practice exercise on ' + name + '?';
+          userInput.focus({ preventScroll: true });
+          scrollToBottom(true);
+        });
 
         const nameSpan = document.createElement('span');
         nameSpan.className = 'progress-item-name';
@@ -5090,8 +5394,24 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         }
         dateSpan.textContent = dateFormatted;
 
+        const practiceBtn = document.createElement('button');
+        practiceBtn.type = 'button';
+        practiceBtn.className = 'btn-practice-concept';
+        practiceBtn.textContent = 'Practice';
+        practiceBtn.title = 'Practice on ' + name;
+        practiceBtn.setAttribute('aria-label', 'Practice on ' + name);
+        practiceBtn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          // Action finishes in chat (Requirement 2): switch view and scroll to bottom
+          showView('chat');
+          userInput.value = 'Can you give me a practice exercise on ' + name + '?';
+          userInput.focus({ preventScroll: true });
+          scrollToBottom(true);
+        });
+
         metaSpan.appendChild(countSpan);
         metaSpan.appendChild(dateSpan);
+        metaSpan.appendChild(practiceBtn);
 
         row.appendChild(nameSpan);
         row.appendChild(metaSpan);
@@ -5106,6 +5426,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     if (reviewCodeBtn) {
       reviewCodeBtn.addEventListener('click', function() {
         if (isLoading) return;
+        // Action finishes in chat (Requirement 2): switch view and scroll to bottom
+        showView('chat');
+        scrollToBottom(true);
         vscode.postMessage({ type: 'reviewFile' });
       });
     }
@@ -5114,7 +5437,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       finishFeatureBtn.addEventListener('click', function() {
         finishFeatureBtn.style.display = 'none';
         explainBackPanel.style.display = 'flex';
-        explainBackInput.focus();
+        // Inline panel scroll into view & preventScroll focus (Requirement 3)
+        scrollAndFocusInline(explainBackPanel, explainBackInput);
       });
     }
 
@@ -5151,7 +5475,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           explainCharCount.textContent = '0 / 15 chars min';
         }
 
-        appendUserMessage('Explaining my understanding:\\n' + text);
+        appendUserMessage('Explaining my understanding:\n' + text);
 
         vscode.postMessage({
           type: 'explainBack',
@@ -5187,7 +5511,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     sendBtn.addEventListener('click', sendMessage);
 
-    // Keyboard handlers (Requirement D.4: Enter sends, Shift+Enter newline, Escape cancels)
+    // Keyboard handlers (Requirement D.4 & Requirement 1: Escape returns to chat or cancels request)
     userInput.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -5196,9 +5520,16 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     window.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape' && isLoading) {
-        e.preventDefault();
-        vscode.postMessage({ type: 'cancelRequest' });
+      if (e.key === 'Escape') {
+        if (currentView !== 'chat') {
+          e.preventDefault();
+          showView('chat');
+          return;
+        }
+        if (isLoading) {
+          e.preventDefault();
+          vscode.postMessage({ type: 'cancelRequest' });
+        }
       }
     });
 
@@ -5214,23 +5545,26 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     newTaskBtn.addEventListener('click', function() {
+      showView('chat');
+      scrollToBottom(true);
       vscode.postMessage({ type: 'newTask' });
     });
 
     if (quizMeBtn) {
       quizMeBtn.addEventListener('click', function() {
         if (isLoading) return;
+        showView('chat');
+        scrollToBottom(true);
         vscode.postMessage({ type: 'startQuiz' });
       });
     }
 
     function openPlanPanel() {
       if (planFirstPanel) {
+        showView('chat');
         planFirstPanel.style.display = 'flex';
-        if (planFirstInput) {
-          planFirstInput.focus();
-        }
-        scrollToBottom(true);
+        // Inline panel scroll into view & preventScroll focus (Requirement 3)
+        scrollAndFocusInline(planFirstPanel, planFirstInput);
       }
     }
 
@@ -5242,7 +5576,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     if (planFirstBtn) {
       planFirstBtn.addEventListener('click', function() {
-        if (planFirstPanel && planFirstPanel.style.display === 'flex') {
+        if (currentView !== 'chat') {
+          showView('chat');
+          openPlanPanel();
+        } else if (planFirstPanel && planFirstPanel.style.display === 'flex') {
           closePlanPanel();
         } else {
           openPlanPanel();
@@ -5252,6 +5589,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     if (welcomePlanFirstChip) {
       welcomePlanFirstChip.addEventListener('click', function() {
+        showView('chat');
         openPlanPanel();
       });
     }
@@ -5291,6 +5629,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     if (reviewStructureBtn) {
       reviewStructureBtn.addEventListener('click', function() {
         if (isLoading) return;
+        showView('chat');
+        scrollToBottom(true);
         vscode.postMessage({ type: 'reviewStructure' });
       });
     }
@@ -5374,14 +5714,6 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         case 'taskReset':
         case 'historyCleared': {
           messagesContainer.innerHTML = '';
-          if (historyPanel) {
-            historyPanel.style.display = 'none';
-            messagesContainer.appendChild(historyPanel);
-          }
-          if (progressPanel) {
-            progressPanel.style.display = 'none';
-            messagesContainer.appendChild(progressPanel);
-          }
           if (welcomeCard) {
             welcomeCard.style.display = 'flex';
             if (welcomeContinueCard) {
@@ -5390,6 +5722,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             messagesContainer.appendChild(welcomeCard);
             updateWelcomeCardUI();
           }
+          savedChatScrollTop = 0;
+          savedChatWasAtBottom = true;
+          showView('chat');
           selectHintLevel(1);
           hideSolutionConfirmation();
           userInput.value = '';
@@ -5430,8 +5765,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           const session = message.session;
           if (!session) break;
 
-          if (historyPanel) historyPanel.style.display = 'none';
-          if (progressPanel) progressPanel.style.display = 'none';
+          // Switch to chat view (Requirement 2)
+          showView('chat');
 
           // Clear existing messages from UI
           const rows = messagesContainer.querySelectorAll('.message-row, .cancelled-note, .notice-card');
@@ -5478,7 +5813,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             explainBackSection.style.display = 'block';
           }
 
-          // Scroll to newest message after restoring (Requirement 5)
+          // Scroll to newest message after restoring (Requirement 2 & 5)
           scrollToBottom(true);
           break;
         }
@@ -5507,8 +5842,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
         case 'openHistory': {
           // Requirement 6 & 8: Open history panel from command or header
-          if (progressPanel) progressPanel.style.display = 'none';
-          if (historyPanel) historyPanel.style.display = 'flex';
+          showView('history');
+          vscode.postMessage({ type: 'getSessions' });
           break;
         }
 
@@ -5721,7 +6056,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       row.appendChild(card);
       messagesContainer.appendChild(row);
-      scrollToBottom(true);
+      const firstBtn = card.querySelector('button');
+      // Inline panel scroll into view & preventScroll focus (Requirement 3)
+      scrollAndFocusInline(card, firstBtn || card);
     }
 
     function renderPasteCheckPrompt(data) {
@@ -5800,8 +6137,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       row.appendChild(panel);
       messagesContainer.appendChild(row);
-      scrollToBottom(true);
-      textarea.focus();
+      // Inline panel scroll into view & preventScroll focus (Requirement 3)
+      scrollAndFocusInline(panel, textarea);
     }
 
     function renderMentorReplyCard(reply, mode) {
@@ -6152,6 +6489,16 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             const chip = document.createElement('span');
             chip.className = 'concept-chip';
             chip.textContent = conceptName.trim();
+            chip.style.cursor = 'pointer';
+            chip.title = 'Practice on ' + conceptName.trim();
+            chip.setAttribute('aria-label', 'Practice on ' + conceptName.trim());
+            chip.addEventListener('click', function() {
+              // Action finishes in chat (Requirement 2): switch view and scroll to bottom
+              showView('chat');
+              userInput.value = 'Can you give me a practice exercise on ' + conceptName.trim() + '?';
+              userInput.focus({ preventScroll: true });
+              scrollToBottom(true);
+            });
             conceptsBox.appendChild(chip);
           });
 
@@ -6302,6 +6649,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      // Quiz is rendered inside chat view (Requirement 2)
+      showView('chat');
+
       if (welcomeCard) {
         welcomeCard.style.display = 'none';
       }
@@ -6431,6 +6781,10 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         footer.appendChild(actionBtnContainer);
 
         card.appendChild(footer);
+
+        // Inline panel scroll into view & preventScroll focus (Requirement 3)
+        const firstOption = optionEls.length > 0 ? optionEls[0] : null;
+        scrollAndFocusInline(card, firstOption || card);
 
         // Keyboard handler for the options
         function handleKeyDown(e) {
@@ -6603,10 +6957,12 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             chip.textContent = '↻ ' + concept;
             chip.title = 'Ask mentor to explain ' + concept;
             chip.addEventListener('click', function() {
+              showView('chat');
               userInput.value = 'Can you explain ' + concept + ' again?';
               userInput.style.height = 'auto';
               userInput.style.height = Math.min(userInput.scrollHeight, 140) + 'px';
-              userInput.focus();
+              userInput.focus({ preventScroll: true });
+              scrollToBottom(true);
             });
             chipsWrap.appendChild(chip);
           });
@@ -6623,6 +6979,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         retakeBtn.className = 'btn-action';
         retakeBtn.textContent = 'Retake with new questions';
         retakeBtn.addEventListener('click', function() {
+          showView('chat');
           vscode.postMessage({ type: 'startQuiz' });
         });
         actions.appendChild(retakeBtn);
@@ -6632,7 +6989,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         backBtn.className = 'cancel-btn';
         backBtn.textContent = 'Back to chat';
         backBtn.addEventListener('click', function() {
-          userInput.focus();
+          showView('chat');
+          userInput.focus({ preventScroll: true });
           scrollToBottom(true);
         });
         actions.appendChild(backBtn);
