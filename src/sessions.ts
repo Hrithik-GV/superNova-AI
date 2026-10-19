@@ -23,7 +23,7 @@ export const MAX_MESSAGES_PER_SESSION = 200;
 export interface StoredMessage {
   role: 'user' | 'assistant';
   text: string;            // learner text, or the raw JSON string of the mentor reply
-  mode: string;            // chat | explain | review | explain_back | paste_check | quiz
+  mode: string;            // chat | explain | review | explain_back | paste_check | quiz | plan_review | architecture
   ts: string;              // ISO date
 }
 

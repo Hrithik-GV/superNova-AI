@@ -300,6 +300,14 @@ export async function activate(context: vscode.ExtensionContext) {
       await provider.startQuiz();
     })
   );
+
+  // Review Project Structure command (Requirement B.1): "Mentor: Review Project Structure"
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mentor.reviewStructure', async () => {
+      await vscode.commands.executeCommand('mentor.chat.focus');
+      await provider.reviewProjectStructure();
+    })
+  );
 }
 
 export function deactivate() {
@@ -319,7 +327,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   // Per-task state retained on the extension host
   private _currentLevel: 1 | 2 | 3 | 4 = 1;
   private _currentTaskText: string = '';
-  private _currentMode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' | 'quiz' = 'task';
+  private _currentMode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' | 'quiz' | 'plan_review' | 'architecture' = 'task';
 
   // Persistent session management (Requirements 1, 3, 5)
   private _activeSession: Session | null = null;
@@ -344,7 +352,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   // Last request cache for seamless Retry (Requirement C.2)
   private _lastRequest: {
     content: string;
-    mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' | 'quiz';
+    mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' | 'quiz' | 'plan_review' | 'architecture';
     hintLevel: number;
     learnerVisibleText?: string;
   } | null = null;
@@ -353,6 +361,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   private _isWebviewReady: boolean = false;
   private _pendingExplain: { fileName: string; languageId: string; code: string } | null = null;
   private _pendingReview: { fileName: string; languageId: string; code: string } | null = null;
+  private _pendingReviewStructure: boolean = false;
+  private _structureConsentSessionId: string | null = null;
   private _pendingPasteExplain: PasteEventPayload | null = null;
   private _pendingStartQuiz: { forceIntermediate?: boolean } | null = null;
   private _pastQuizQuestions: string[] = [];
@@ -465,8 +475,11 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             isOnboarded: this._isOnboarded
           });
 
-          // Check command queues first (Requirement 8 & Quick Quiz Entry Point)
-          if (this._pendingStartQuiz) {
+          // Check command queues first (Requirements & Handshakes)
+          if (this._pendingReviewStructure) {
+            this._pendingReviewStructure = false;
+            await this.reviewProjectStructure();
+          } else if (this._pendingStartQuiz) {
             const pending = this._pendingStartQuiz;
             this._pendingStartQuiz = null;
             await this.startQuiz(pending.forceIntermediate);
@@ -535,6 +548,38 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           }
           await this._markOnboarded();
           await this.reviewActiveFile();
+          break;
+        }
+
+        case 'submitPlanReview': {
+          if (this._isRequestInProgress) {
+            return;
+          }
+          await this._markOnboarded();
+          await this._handleSubmitPlanReview(message.planText);
+          break;
+        }
+
+        case 'reviewStructure': {
+          if (this._isRequestInProgress) {
+            return;
+          }
+          await this._markOnboarded();
+          await this.reviewProjectStructure();
+          break;
+        }
+
+        case 'confirmReviewStructure': {
+          if (this._isRequestInProgress) {
+            return;
+          }
+          await this._markOnboarded();
+          if (this._activeSession) {
+            this._structureConsentSessionId = this._activeSession.id;
+          } else {
+            this._structureConsentSessionId = 'consented';
+          }
+          await this._performStructureReview();
           break;
         }
 
@@ -701,6 +746,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           this._currentTaskText = '';
           this._currentMode = 'task';
           this._lastRequest = null;
+          this._structureConsentSessionId = null;
           this._postMessageToWebview({
             type: 'taskReset'
           });
@@ -887,6 +933,348 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     const prompt = `Mode: review\nFile: ${fileName} (${languageId})\nCurrent file:\n${code}`;
     await this._executePrompt(prompt, 'review', 1, false, `Reviewing ${fileName}...`);
+  }
+
+  /**
+   * ===========================================================================
+   * PLAN FIRST: SUBMIT PLAN REVIEW (Requirement A)
+   * ===========================================================================
+   * Handles submission of learner's architectural plan before code implementation.
+   * Mode: plan_review.
+   * Evaluates components, HTML hierarchy, CSS layout strategy, and JS behavior.
+   *
+   * @param planText - The learner's submitted plan text (min 30 characters).
+   */
+  private async _handleSubmitPlanReview(planText: string): Promise<void> {
+    const trimmedPlan = (planText || '').trim();
+    if (trimmedPlan.length < 30) {
+      return;
+    }
+
+    this._currentMode = 'plan_review';
+    await this._markOnboarded();
+
+    // Derive task from current task text, active session originalTask, or first user message
+    const taskStr = this._currentTaskText ||
+      (this._activeSession?.originalTask) ||
+      (this._history.find(m => m.role === 'user')?.content) ||
+      'New web project';
+    const level = (this._currentConfig.mode === 'intermediate' ? 'intermediate' : 'beginner');
+
+    // Prompt format specified in Requirement A.2
+    const prompt = `Mode: plan_review\nTask: ${taskStr}\nLevel: ${level}\nLearner's plan:\n${trimmedPlan}`;
+
+    // Pass trimmedPlan as learnerVisibleText so plan text is saved as a normal user message
+    // in session (not file contents), and reply is added to session as usual (Requirement A.4)
+    await this._executePrompt(prompt, 'plan_review', 1, false, trimmedPlan);
+  }
+
+  /**
+   * ===========================================================================
+   * REVIEW PROJECT STRUCTURE: ENTRY POINT & PRIVACY (Requirements B.1, B.3, B.6)
+   * ===========================================================================
+   * Command "mentor.reviewStructure" titled "Mentor: Review Project Structure".
+   * Checks for an open workspace folder, requests privacy consent once per session,
+   * and dispatches project structure review.
+   */
+  public async reviewProjectStructure(): Promise<void> {
+    if (this._isRequestInProgress) {
+      return;
+    }
+
+    if (!this._view || !this._isWebviewReady) {
+      this._pendingReviewStructure = true;
+      return;
+    }
+
+    await this._markOnboarded();
+
+    // Requirement B.6: If there is no workspace folder, show friendly in-chat message and do NOT call LLM
+    if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+      this._postMessageToWebview({
+        type: 'noticeMessage',
+        text: 'Please open a project folder in VS Code to review its project structure.'
+      });
+      return;
+    }
+
+    // Ensure an active session exists so consent can be tracked per session
+    if (!this._activeSession) {
+      this._activeSession = createNewSession(
+        'Project Structure Review',
+        this._currentLevel,
+        'Review project structure'
+      );
+      await setActiveSessionId(this._globalState, this._activeSession.id);
+    }
+
+    // Requirement B.3: PRIVACY - before sending, show inline confirmation once per session
+    if (this._structureConsentSessionId === this._activeSession.id) {
+      // Already consented in this session: proceed directly
+      await this._performStructureReview();
+    } else {
+      // Ask learner for confirmation once per session
+      this._postMessageToWebview({
+        type: 'structureConsentPrompt'
+      });
+    }
+  }
+
+  /**
+   * ===========================================================================
+   * PERFORM STRUCTURE REVIEW: LLM DISPATCH (Requirements B.2, B.4, B.7)
+   * ===========================================================================
+   * Collects file tree and key file snippets, builds prompt, and dispatches via _executePrompt.
+   */
+  private async _performStructureReview(): Promise<void> {
+    if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+      return;
+    }
+
+    const rootFolder = vscode.workspace.workspaceFolders[0];
+    const rootUri = rootFolder.uri;
+
+    this._currentMode = 'architecture';
+
+    // Requirement B.7: Learner-side line in chat
+    const learnerVisibleText = 'Reviewing your project structure...';
+    this._postMessageToWebview({
+      type: 'userMessage',
+      text: learnerVisibleText
+    });
+
+    try {
+      // Collect file tree and key files using vscode.workspace.fs (NO shell commands)
+      const { treeText, keyFilesText } = await this._collectProjectStructure(rootUri);
+
+      const level = (this._currentConfig.mode === 'intermediate' ? 'intermediate' : 'beginner');
+
+      // Requirement B.2: Truncate everything to about 6000 characters total
+      let structureBody = `File tree:\n${treeText}\n\nKey files:\n${keyFilesText}`;
+      if (structureBody.length > 6000) {
+        structureBody = structureBody.slice(0, 5920) + '\n\n... (project structure truncated to 6000 characters)';
+      }
+
+      // Requirement B.4: Prompt structure
+      const prompt = `Mode: architecture\nLevel: ${level}\n${structureBody}`;
+
+      // Dispatch request through shared _executePrompt (reuses Day 6 loading, Cancel, timeout, error & retry)
+      await this._executePrompt(prompt, 'architecture', 1, false, learnerVisibleText);
+    } catch (err: any) {
+      logError('Failed to review project structure', err);
+      this._postMessageToWebview({
+        type: 'noticeMessage',
+        text: 'Could not inspect workspace files for structure review.'
+      });
+    }
+  }
+
+  /**
+   * ===========================================================================
+   * PROJECT STRUCTURE COLLECTION VIA VSCODE.WORKSPACE.FS (Requirement B.2 & B.3)
+   * ===========================================================================
+   * Traverses workspace directory strictly using vscode.workspace.fs (NO shell commands).
+   *
+   * FILE COLLECTION AND EXCLUSION RULES:
+   * 1. Max Depth: 3 levels from workspace root.
+   * 2. Max Entries: 80 entries total across the file tree.
+   * 3. Excluded Directories:
+   *    - node_modules, .git, .vscode, out, dist, build
+   * 4. Excluded Files:
+   *    - Hidden files (starting with '.')
+   *    - VSIX extension packages (.vsix)
+   *    - Image files (.png, .jpg, .jpeg, .gif, .svg, .ico, .webp, .bmp, .tiff, .avif)
+   * 5. Privacy & Sensitive Content Filter (Requirement B.3):
+   *    - Never read files outside the workspace folder
+   *    - Never include .env files (e.g. .env, .env.local, .env.production)
+   *    - Never include files matching *secret*, *token*, *.pem, *.key, *.cert, *.crt, *.id_rsa
+   * 6. Key Files Collection (First 40 lines of up to 5 files):
+   *    - index.html (or first .html found)
+   *    - Main CSS file (style.css, styles.css, index.css, app.css, or first .css)
+   *    - Main script file (index.js/ts, app.js/ts, main.js/ts, App.jsx/tsx, or first script)
+   *    - package.json if present
+   *    - Additional key files up to 5 files max
+   * 7. Total truncation to ~6000 characters.
+   */
+  private async _collectProjectStructure(rootUri: vscode.Uri): Promise<{ treeText: string; keyFilesText: string }> {
+    const treeLines: string[] = [];
+    const discoveredFiles: { name: string; relativePath: string; uri: vscode.Uri }[] = [];
+    let totalEntriesCount = 0;
+    const maxDepth = 3;
+    const maxEntries = 80;
+
+    /**
+     * Exclusion & Sensitivity predicate implementing Requirement B.2 and B.3.
+     */
+    const isExcludedOrSensitive = (name: string): boolean => {
+      const lower = name.toLowerCase();
+
+      // Rule: Exclude all hidden files and hidden directories (starting with '.')
+      if (name.startsWith('.')) {
+        return true;
+      }
+
+      // Rule: Exclude common dependency and build output folders
+      const excludedFolders = ['node_modules', 'out', 'dist', 'build', '.git', '.vscode'];
+      if (excludedFolders.includes(lower)) {
+        return true;
+      }
+
+      // Rule: Exclude .vsix packages
+      if (lower.endsWith('.vsix')) {
+        return true;
+      }
+
+      // Rule: Exclude static image binary assets
+      const imageExts = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.webp', '.bmp', '.tiff', '.avif'];
+      if (imageExts.some(ext => lower.endsWith(ext))) {
+        return true;
+      }
+
+      // Rule: Never include .env files, key files or anything matching *secret*, *token*, *.pem, *.key
+      if (lower.startsWith('.env') || lower.endsWith('.env') || lower === 'env') {
+        return true;
+      }
+      if (lower.includes('secret') || lower.includes('token')) {
+        return true;
+      }
+      if (
+        lower.endsWith('.pem') ||
+        lower.endsWith('.key') ||
+        lower.endsWith('.cert') ||
+        lower.endsWith('.crt') ||
+        lower.endsWith('.id_rsa')
+      ) {
+        return true;
+      }
+
+      return false;
+    };
+
+    /**
+     * Recursive directory walker using vscode.workspace.fs.readDirectory.
+     */
+    const walkDirectory = async (currentUri: vscode.Uri, currentRelPath: string, depth: number): Promise<void> => {
+      if (depth > maxDepth || totalEntriesCount >= maxEntries) {
+        return;
+      }
+
+      let entries: [string, vscode.FileType][];
+      try {
+        entries = await vscode.workspace.fs.readDirectory(currentUri);
+      } catch {
+        return;
+      }
+
+      // Sort directories first, then files alphabetically for consistent tree output
+      entries.sort((a, b) => {
+        const isDirA = (a[1] & vscode.FileType.Directory) !== 0;
+        const isDirB = (b[1] & vscode.FileType.Directory) !== 0;
+        if (isDirA && !isDirB) return -1;
+        if (!isDirA && isDirB) return 1;
+        return a[0].localeCompare(b[0]);
+      });
+
+      for (const [name, fileType] of entries) {
+        if (totalEntriesCount >= maxEntries) {
+          break;
+        }
+
+        if (isExcludedOrSensitive(name)) {
+          continue;
+        }
+
+        const isDirectory = (fileType & vscode.FileType.Directory) !== 0;
+        const isFile = (fileType & vscode.FileType.File) !== 0;
+        const relPath = currentRelPath ? `${currentRelPath}/${name}` : name;
+        const entryUri = vscode.Uri.joinPath(currentUri, name);
+
+        // Security check: strictly verify entry is within workspace folder
+        if (!entryUri.fsPath.startsWith(rootUri.fsPath)) {
+          continue;
+        }
+
+        totalEntriesCount++;
+        const indent = '  '.repeat(depth - 1);
+
+        if (isDirectory) {
+          treeLines.push(`${indent}${name}/`);
+          if (depth < maxDepth && totalEntriesCount < maxEntries) {
+            await walkDirectory(entryUri, relPath, depth + 1);
+          }
+        } else if (isFile) {
+          treeLines.push(`${indent}${name}`);
+          discoveredFiles.push({
+            name,
+            relativePath: relPath,
+            uri: entryUri
+          });
+        }
+      }
+    };
+
+    // Start traversal at workspace root
+    await walkDirectory(rootUri, '', 1);
+
+    // Key files collection: first 40 lines of up to 5 key files
+    const selectedKeyFiles: { name: string; relativePath: string; uri: vscode.Uri }[] = [];
+    const addedPaths = new Set<string>();
+
+    const addKeyFileCandidate = (file?: { name: string; relativePath: string; uri: vscode.Uri }) => {
+      if (file && !addedPaths.has(file.relativePath) && selectedKeyFiles.length < 5) {
+        addedPaths.add(file.relativePath);
+        selectedKeyFiles.push(file);
+      }
+    };
+
+    // 1. index.html or first .html file
+    const indexHtml = discoveredFiles.find(f => f.name.toLowerCase() === 'index.html');
+    const firstHtml = discoveredFiles.find(f => f.name.toLowerCase().endsWith('.html'));
+    addKeyFileCandidate(indexHtml || firstHtml);
+
+    // 2. Main .css file
+    const mainCssNames = ['style.css', 'styles.css', 'index.css', 'app.css', 'main.css'];
+    const mainCss = discoveredFiles.find(f => mainCssNames.includes(f.name.toLowerCase()));
+    const firstCss = discoveredFiles.find(f => f.name.toLowerCase().endsWith('.css'));
+    addKeyFileCandidate(mainCss || firstCss);
+
+    // 3. Main .js/.ts/.jsx/.tsx file
+    const mainScriptNames = ['index.js', 'index.ts', 'app.js', 'app.ts', 'main.js', 'main.ts', 'app.jsx', 'app.tsx'];
+    const mainScript = discoveredFiles.find(f => mainScriptNames.includes(f.name.toLowerCase()));
+    const firstScript = discoveredFiles.find(f => {
+      const l = f.name.toLowerCase();
+      return (l.endsWith('.js') || l.endsWith('.ts') || l.endsWith('.jsx') || l.endsWith('.tsx')) &&
+        !l.endsWith('.d.ts') && !l.endsWith('.test.ts') && !l.endsWith('.spec.ts');
+    });
+    addKeyFileCandidate(mainScript || firstScript);
+
+    // 4. package.json if present
+    const pkgJson = discoveredFiles.find(f => f.name.toLowerCase() === 'package.json');
+    addKeyFileCandidate(pkgJson);
+
+    // 5. Fill any remaining slots up to 5 with other discovered code files
+    for (const f of discoveredFiles) {
+      if (selectedKeyFiles.length >= 5) break;
+      addKeyFileCandidate(f);
+    }
+
+    // Read first 40 lines of up to 5 key files using vscode.workspace.fs.readFile
+    const keyFilesBlocks: string[] = [];
+    for (const kf of selectedKeyFiles) {
+      try {
+        const fileBytes = await vscode.workspace.fs.readFile(kf.uri);
+        const fileContent = new TextDecoder('utf-8').decode(fileBytes);
+        const first40Lines = fileContent.split(/\r?\n/).slice(0, 40).join('\n');
+        keyFilesBlocks.push(`--- ${kf.relativePath} (first 40 lines) ---\n${first40Lines}`);
+      } catch (readErr) {
+        logError(`Failed to read key file ${kf.relativePath}`, readErr);
+      }
+    }
+
+    const treeText = treeLines.join('\n') || '(no files found in workspace)';
+    const keyFilesText = keyFilesBlocks.join('\n\n') || '(no key files found)';
+
+    return { treeText, keyFilesText };
   }
 
   /**
@@ -1565,7 +1953,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
    */
   private async _executePrompt(
     userMessageContent: string,
-    mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check',
+    mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' | 'plan_review' | 'architecture',
     hintLevel: number,
     isRetry: boolean = false,
     learnerVisibleText?: string
@@ -3032,6 +3420,122 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       cursor: not-allowed;
     }
 
+    /* Plan First Inline Panel (Requirement A.1) */
+    .plan-first-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 12px;
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-focusBorder, rgba(0, 122, 204, 0.4));
+      border-left: 3px solid var(--vscode-textLink-foreground, #007acc);
+      border-radius: 4px;
+      margin-bottom: 6px;
+      animation: fadeIn 0.15s ease-in-out;
+    }
+
+    .plan-first-panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .plan-first-title {
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--vscode-textLink-foreground, inherit);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .plan-first-guidance {
+      font-size: 11.5px;
+      line-height: 1.45;
+      opacity: 0.95;
+    }
+
+    textarea#plan-first-input {
+      width: 100%;
+      min-height: 68px;
+      max-height: 160px;
+      padding: 6px 8px;
+      border: 1px solid var(--vscode-input-border, rgba(128, 128, 128, 0.3));
+      border-radius: 3px;
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      font-family: var(--font-family);
+      font-size: 12px;
+      resize: vertical;
+      outline: none;
+      line-height: 1.4;
+    }
+
+    textarea#plan-first-input:focus {
+      border-color: var(--vscode-focusBorder);
+      outline: 1px solid var(--vscode-focusBorder);
+    }
+
+    .plan-first-panel-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .btn-submit-plan {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 500;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .btn-submit-plan:hover:not(:disabled) {
+      background: var(--vscode-button-hoverBackground);
+    }
+
+    .btn-submit-plan:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    /* Structure Privacy Consent Card (Requirement B.3) */
+    .structure-consent-card {
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
+      border-left: 3px solid var(--vscode-editorWarning-foreground, #cca700);
+      border-radius: 4px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      animation: fadeIn 0.15s ease-in-out;
+    }
+
+    .structure-consent-header {
+      font-weight: 600;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--vscode-foreground);
+    }
+
+    .structure-consent-text {
+      font-size: 12px;
+      line-height: 1.45;
+      opacity: 0.95;
+    }
+
+    .structure-consent-actions {
+      display: flex;
+      gap: 6px;
+    }
+
     /* Hint Ladder */
     .hint-ladder-container {
       display: flex;
@@ -3871,6 +4375,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       <div class="header-actions">
         <button id="history-toggle-btn" title="View past chat sessions" aria-label="View chat history">📜 History</button>
         <button id="progress-toggle-btn" title="View your learned concepts" aria-label="View learning progress">📊 Progress</button>
+        <button id="plan-first-btn" title="Outline your plan before writing code" aria-label="Plan it first">📋 Plan it first</button>
+        <button id="review-structure-btn" title="Mentor: Review Project Structure" aria-label="Review project structure">🏗️ Structure</button>
         <button id="review-code-btn" title="Review my current active file" aria-label="Review active file">🔍 Review</button>
         <button id="quiz-me-btn" title="Take a quick quiz on concepts and your code" aria-label="Take quick quiz">🎯 Quiz me</button>
         <button id="new-task-btn" title="Clear conversation history and reset level to 1" aria-label="Start new task">+ New task</button>
@@ -3955,6 +4461,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         <div class="example-chips-container">
           <span class="example-chips-label">Try asking:</span>
           <div class="example-chips-list">
+            <button type="button" class="prompt-chip" id="welcome-plan-first-chip">📋 Plan it first</button>
             <button type="button" class="prompt-chip" data-prompt="Build a responsive navbar">Build a responsive navbar</button>
             <button type="button" class="prompt-chip" data-prompt="Make a card with an image and title">Make a card with an image and title</button>
             <button type="button" class="prompt-chip" data-prompt="Explain the code I selected">Explain the code I selected</button>
@@ -3988,6 +4495,20 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
   <!-- Chat Footer -->
   <div class="chat-footer">
+    <!-- Plan First Inline Panel (Requirement A.1) -->
+    <div class="plan-first-panel" id="plan-first-panel" style="display: none;">
+      <div class="plan-first-panel-header">
+        <span class="plan-first-title">📋 Plan Your Architecture First</span>
+        <button type="button" class="btn-close-panel" id="close-plan-panel" aria-label="Close plan panel">✕</button>
+      </div>
+      <p class="plan-first-guidance">Before writing code, outline your plan: the sections or components, the HTML structure, how you will lay it out with CSS, and what JavaScript behavior you need.</p>
+      <textarea id="plan-first-input" placeholder="Outline your plan (components, HTML structure, CSS layout, JS logic)..."></textarea>
+      <div class="plan-first-panel-footer">
+        <span class="char-count" id="plan-char-count">0 / 30 chars min</span>
+        <button type="button" class="btn-submit-plan" id="submit-plan-btn" disabled>Submit Plan</button>
+      </div>
+    </div>
+
     <!-- Explain It Back Section -->
     <div class="explain-back-section" id="explain-back-section" style="display: none;">
       <button type="button" class="finish-feature-btn" id="finish-feature-btn">
@@ -4051,6 +4572,14 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     const newTaskBtn = document.getElementById('new-task-btn');
     const reviewCodeBtn = document.getElementById('review-code-btn');
     const quizMeBtn = document.getElementById('quiz-me-btn');
+    const planFirstBtn = document.getElementById('plan-first-btn');
+    const reviewStructureBtn = document.getElementById('review-structure-btn');
+    const welcomePlanFirstChip = document.getElementById('welcome-plan-first-chip');
+    const planFirstPanel = document.getElementById('plan-first-panel');
+    const closePlanPanelBtn = document.getElementById('close-plan-panel');
+    const planFirstInput = document.getElementById('plan-first-input');
+    const planCharCount = document.getElementById('plan-char-count');
+    const submitPlanBtn = document.getElementById('submit-plan-btn');
 
     // Progress elements
     const progressToggleBtn = document.getElementById('progress-toggle-btn');
@@ -4695,6 +5224,77 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
+    function openPlanPanel() {
+      if (planFirstPanel) {
+        planFirstPanel.style.display = 'flex';
+        if (planFirstInput) {
+          planFirstInput.focus();
+        }
+        scrollToBottom(true);
+      }
+    }
+
+    function closePlanPanel() {
+      if (planFirstPanel) {
+        planFirstPanel.style.display = 'none';
+      }
+    }
+
+    if (planFirstBtn) {
+      planFirstBtn.addEventListener('click', function() {
+        if (planFirstPanel && planFirstPanel.style.display === 'flex') {
+          closePlanPanel();
+        } else {
+          openPlanPanel();
+        }
+      });
+    }
+
+    if (welcomePlanFirstChip) {
+      welcomePlanFirstChip.addEventListener('click', function() {
+        openPlanPanel();
+      });
+    }
+
+    if (closePlanPanelBtn) {
+      closePlanPanelBtn.addEventListener('click', function() {
+        closePlanPanel();
+      });
+    }
+
+    if (planFirstInput) {
+      planFirstInput.addEventListener('input', function() {
+        const text = planFirstInput.value.trim();
+        const len = text.length;
+        if (planCharCount) {
+          planCharCount.textContent = len + ' / 30 chars min';
+        }
+        if (submitPlanBtn) {
+          submitPlanBtn.disabled = (len < 30) || isLoading;
+        }
+      });
+    }
+
+    if (submitPlanBtn) {
+      submitPlanBtn.addEventListener('click', function() {
+        const text = planFirstInput.value.trim();
+        if (text.length < 30 || isLoading) return;
+        closePlanPanel();
+        appendUserMessage(text);
+        vscode.postMessage({
+          type: 'submitPlanReview',
+          planText: text
+        });
+      });
+    }
+
+    if (reviewStructureBtn) {
+      reviewStructureBtn.addEventListener('click', function() {
+        if (isLoading) return;
+        vscode.postMessage({ type: 'reviewStructure' });
+      });
+    }
+
     // -------------------------------------------------------------------------
     // INCOMING: Receiving messages from Extension Host in the Webview
     // -------------------------------------------------------------------------
@@ -4761,6 +5361,11 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           break;
         }
 
+        case 'structureConsentPrompt': {
+          renderStructureConsentCard();
+          break;
+        }
+
         case 'loading': {
           setLoading(message.loading);
           break;
@@ -4789,6 +5394,17 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           hideSolutionConfirmation();
           userInput.value = '';
           userInput.style.height = 'auto';
+
+          closePlanPanel();
+          if (planFirstInput) {
+            planFirstInput.value = '';
+          }
+          if (submitPlanBtn) {
+            submitPlanBtn.disabled = true;
+          }
+          if (planCharCount) {
+            planCharCount.textContent = '0 / 30 chars min';
+          }
 
           hasReplies = false;
           if (explainBackSection) {
@@ -4915,6 +5531,15 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       if (reviewCodeBtn) {
         reviewCodeBtn.disabled = loading;
       }
+      if (reviewStructureBtn) {
+        reviewStructureBtn.disabled = loading;
+      }
+      if (planFirstBtn) {
+        planFirstBtn.disabled = loading;
+      }
+      if (submitPlanBtn) {
+        submitPlanBtn.disabled = loading || (planFirstInput && planFirstInput.value.trim().length < 30);
+      }
 
       // Disable hint buttons during loading (Requirement B.1)
       for (let i = 1; i <= 4; i++) {
@@ -4930,6 +5555,60 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       } else {
         loadingRow.classList.remove('visible');
       }
+    }
+
+    /**
+     * Requirement B.3: Inline privacy confirmation card for structure review.
+     * "This sends your file names and the first lines of up to 5 files to your AI provider."
+     * with "Send" and "Cancel".
+     */
+    function renderStructureConsentCard() {
+      if (welcomeCard) {
+        welcomeCard.style.display = 'none';
+      }
+
+      const row = document.createElement('div');
+      row.className = 'message-row mentor-row';
+
+      const card = document.createElement('div');
+      card.className = 'structure-consent-card';
+
+      const header = document.createElement('div');
+      header.className = 'structure-consent-header';
+      header.innerHTML = '<span>🔒</span> <strong>Project Structure Review</strong>';
+      card.appendChild(header);
+
+      const text = document.createElement('div');
+      text.className = 'structure-consent-text';
+      text.textContent = 'This sends your file names and the first lines of up to 5 files to your AI provider.';
+      card.appendChild(text);
+
+      const actions = document.createElement('div');
+      actions.className = 'structure-consent-actions';
+
+      const sendBtn = document.createElement('button');
+      sendBtn.type = 'button';
+      sendBtn.className = 'btn-action';
+      sendBtn.textContent = 'Send';
+      sendBtn.addEventListener('click', function() {
+        row.remove();
+        vscode.postMessage({ type: 'confirmReviewStructure' });
+      });
+      actions.appendChild(sendBtn);
+
+      const cancelBtn = document.createElement('button');
+      cancelBtn.type = 'button';
+      cancelBtn.className = 'cancel-btn';
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.addEventListener('click', function() {
+        row.remove();
+      });
+      actions.appendChild(cancelBtn);
+
+      card.appendChild(actions);
+      row.appendChild(card);
+      messagesContainer.appendChild(row);
+      scrollToBottom(true);
     }
 
     function appendUserMessage(text) {
@@ -5152,7 +5831,9 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       const isExplainBackMode = (mode === 'explain_back');
       const isPasteCheckMode = (mode === 'paste_check');
       const isQuizMode = (mode === 'quiz');
-      const hideLadderControls = isExplainMode || isReviewMode || isExplainBackMode || isPasteCheckMode || isQuizMode;
+      const isPlanReviewMode = (mode === 'plan_review');
+      const isArchitectureMode = (mode === 'architecture');
+      const hideLadderControls = isExplainMode || isReviewMode || isExplainBackMode || isPasteCheckMode || isQuizMode || isPlanReviewMode || isArchitectureMode;
 
       const row = document.createElement('div');
       row.className = 'message-row mentor-row';
@@ -5175,6 +5856,12 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       } else if (isReviewMode) {
         iconSpan.textContent = '📋';
         nameSpan.textContent = 'Code Mentor (Review)';
+      } else if (isPlanReviewMode) {
+        iconSpan.textContent = '📋';
+        nameSpan.textContent = 'Code Mentor (Plan Review)';
+      } else if (isArchitectureMode) {
+        iconSpan.textContent = '🏗️';
+        nameSpan.textContent = 'Code Mentor (Architecture)';
       } else if (isExplainBackMode || isPasteCheckMode) {
         iconSpan.textContent = '🎯';
         nameSpan.textContent = 'Code Mentor (Understanding Check)';
@@ -5218,7 +5905,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
           const titleEl = document.createElement('div');
           titleEl.className = 'line-notes-title';
-          titleEl.textContent = '📝 Line-by-Line Breakdown';
+          titleEl.textContent = isArchitectureMode ? '📁 What each file does' : '📝 Line-by-Line Breakdown';
           notesContainer.appendChild(titleEl);
 
           const listEl = document.createElement('div');
@@ -5262,7 +5949,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
           const findingsTitle = document.createElement('div');
           findingsTitle.className = 'findings-title';
-          findingsTitle.textContent = '📋 Review Findings';
+          findingsTitle.textContent = isArchitectureMode ? '🏗️ Structure Observations' : (isPlanReviewMode ? '📋 Plan Review Findings' : '📋 Review Findings');
           findingsContainer.appendChild(findingsTitle);
 
           const findingsList = document.createElement('div');

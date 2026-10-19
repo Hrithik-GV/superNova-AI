@@ -36,7 +36,8 @@
     "onCommand:mentor.showLogs",
     "onCommand:mentor.resumeLastSession",
     "onCommand:mentor.showHistory",
-    "onCommand:mentor.startQuiz"
+    "onCommand:mentor.startQuiz",
+    "onCommand:mentor.reviewStructure"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -94,6 +95,10 @@
       {
         "command": "mentor.startQuiz",
         "title": "Mentor: Quiz Me"
+      },
+      {
+        "command": "mentor.reviewStructure",
+        "title": "Mentor: Review Project Structure"
       }
     ],
     "menus": {
