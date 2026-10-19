@@ -29,6 +29,18 @@ export interface ReviewFinding {
 }
 
 /**
+ * Individual multiple-choice question for quiz mode.
+ */
+export interface QuizQuestion {
+  question: string;
+  code: string | null;
+  options: string[];
+  answer_index: number;
+  explanation: string;
+  concept: string;
+}
+
+/**
  * Structured response schema expected from Code Mentor.
  */
 export interface MentorReply {
@@ -43,6 +55,7 @@ export interface MentorReply {
   understanding?: 'solid' | 'partial' | 'shaky'; // optional rating for explain_back/paste_check modes
   got_right?: string[];       // what learner got right in explain_back/paste_check
   gaps?: string[];            // topics/concepts to revisit in explain_back/paste_check
+  quiz?: QuizQuestion[];      // optional multiple-choice questions for quiz mode
 }
 
 /**
@@ -64,7 +77,7 @@ export class MissingApiKeyError extends Error {
  * 2. Strips Markdown fences (```json ... ``` or ``` ... ```) that the LLM may wrap around the JSON.
  * 3. Attempts to parse the JSON with JSON.parse within a try/catch.
  * 4. If direct parsing fails, attempts to isolate the outermost JSON object between { and }.
- * 5. Sanitizes every field (strings, arrays, hint_level bounded to 1..4, line_notes, findings, understanding, got_right, gaps).
+ * 5. Sanitizes every field (strings, arrays, hint_level bounded to 1..4, line_notes, findings, understanding, got_right, gaps, quiz).
  * 6. NEVER throws an exception on bad/malformed JSON; always returns a compliant fallback object.
  *
  * @param raw - The raw text string returned by the Gemini LLM
@@ -83,7 +96,8 @@ export function parseMentorReply(raw: string): MentorReply {
     findings: undefined,
     understanding: undefined,
     got_right: undefined,
-    gaps: undefined
+    gaps: undefined,
+    quiz: undefined
   };
 
   if (!raw || typeof raw !== 'string') {
@@ -228,9 +242,54 @@ export function parseMentorReply(raw: string): MentorReply {
     if (Array.isArray(parsed.gaps)) {
       const items = parsed.gaps
         .filter((item: any) => typeof item === 'string' && item.trim().length > 0)
-        .map((item: string) => item.trim());``
+        .map((item: string) => item.trim());
       if (items.length > 0) {
         gaps = items;
+      }
+    }
+
+    // 3l. Quiz questions (optional array of { question, code, options, answer_index, explanation, concept } for quiz mode)
+    let quiz: QuizQuestion[] | undefined = undefined;
+    if (Array.isArray(parsed.quiz)) {
+      const questions: QuizQuestion[] = [];
+      for (const item of parsed.quiz) {
+        if (item && typeof item === 'object') {
+          const qText = typeof item.question === 'string' ? item.question.trim() : '';
+
+          let code: string | null = null;
+          if (typeof item.code === 'string' && item.code.trim().length > 0) {
+            const lines = item.code.split(/\r?\n/);
+            code = lines.slice(0, 6).join('\n');
+          }
+
+          let options: string[] = [];
+          if (Array.isArray(item.options)) {
+            options = item.options
+              .filter((opt: any) => typeof opt === 'string' && opt.trim().length > 0)
+              .map((opt: string) => opt.trim());
+          }
+
+          let answer_index = 0;
+          const parsedIdx = Number(item.answer_index);
+          if (Number.isInteger(parsedIdx) && parsedIdx >= 0 && parsedIdx <= 3) {
+            answer_index = parsedIdx;
+          }
+
+          const explanation = typeof item.explanation === 'string' ? item.explanation.trim() : '';
+          const conceptName = typeof item.concept === 'string' ? item.concept.trim() : '';
+
+          questions.push({
+            question: qText,
+            code,
+            options,
+            answer_index,
+            explanation,
+            concept: conceptName
+          });
+        }
+      }
+      if (questions.length > 0) {
+        quiz = questions;
       }
     }
 
@@ -245,7 +304,8 @@ export function parseMentorReply(raw: string): MentorReply {
       findings,
       understanding,
       got_right,
-      gaps
+      gaps,
+      quiz
     };
   } catch {
     // If any unexpected error occurs during parsing or sanitization, return fallback

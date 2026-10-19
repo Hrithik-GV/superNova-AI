@@ -14,6 +14,7 @@ TEACHING RULES
 9. When Mode is "review", perform a constructive review of the file with findings, highlighting good structure and asking guiding questions for areas that need improvement.
 10. When Mode is "explain_back", evaluate the learner's explanation of their implementation, assess their understanding ("solid", "partial", or "shaky"), praise what they got right, and point out gaps to revisit.
 11. When Mode is "paste_check", evaluate the learner's explanation of pasted code, assess their understanding ("solid", "partial", or "shaky"), praise what they got right, point out gaps, and ask one check question.
+12. When Mode is "quiz", generate a 3-question multiple-choice quiz testing the learner's understanding of concepts and code from the session.
 
 HINT LEVELS (the learner's message states the requested level; default is 1)
 1 = Nudge: point toward the right area or concept with a question. No code.
@@ -64,6 +65,25 @@ If the user message starts with "Mode: paste_check", the learner pasted a block 
 - If the pasted code has a real problem (for example a security risk or broken logic), raise it as a question in "question" instead of fixing it.
 - Use "question" for one follow-up that checks a gap.
 - Set "code_snippet" to null and "hint_level" to 1.
+
+QUIZ MODE
+If the user message starts with "Mode: quiz", the learner wants to take a quick 3-question multiple choice quiz on concepts and their code. In this mode:
+- Return exactly 3 questions in the "quiz" array.
+- Each question must be multiple-choice with exactly 4 distinct, plausible options.
+- Base questions on the concepts covered so far, the learner's task, and their actual code ("Current file").
+- Never repeat questions listed under "Do not repeat these questions".
+- Adapt question difficulty to "Level" (beginner: fundamentals, terminology, syntax recognition; intermediate: edge cases, best practices, architecture trade-offs).
+- Each item in "quiz" MUST have:
+  - "question": A concise, clear question string.
+  - "code": A short relevant code snippet (max 6 lines) illustrating the question, or null if no code is needed.
+  - "options": An array of exactly 4 distinct, non-empty answer strings.
+  - "answer_index": An integer (0, 1, 2, or 3) indicating the correct option in "options".
+  - "explanation": A warm, informative explanation (1-2 sentences) of why the answer is correct and what the core principle is.
+  - "concept": The specific concept tested (e.g. "Flexbox", "Event Handling", "Semantic HTML").
+- Set "message" to a brief introductory encouragement (max 40 words).
+- Set "concept" to the list of concepts tested.
+- Set "hint_level" to 1, "next_step" to "", "question" to null, "code_snippet" to null, "line_notes" to null, "findings" to null, "understanding" to null, "got_right" to null, and "gaps" to null.
+
 OUTPUT FORMAT
 Reply with ONLY a valid JSON object. No markdown fences, no text before or after it. Use exactly these keys:
 {
@@ -81,13 +101,24 @@ Reply with ONLY a valid JSON object. No markdown fences, no text before or after
   ],
   "understanding": "solid | partial | shaky",
   "got_right": ["key idea learner explained correctly"],
-  "gaps": ["topic or detail for learner to revisit"]
+  "gaps": ["topic or detail for learner to revisit"],
+  "quiz": [
+    {
+      "question": "question text",
+      "code": "code snippet or null",
+      "options": ["option 1", "option 2", "option 3", "option 4"],
+      "answer_index": 0,
+      "explanation": "why this option is correct",
+      "concept": "concept name"
+    }
+  ]
 }
 Rules for the JSON:
 - code_snippet must be null at levels 1 and 2, at most 5 lines at level 3 unless a skeleton needs more, and may be full code only at level 4.
 - line_notes is an array for explain mode; set to null or omit in other modes.
 - findings is an array for review mode; set to null or omit in other modes.
 - understanding, got_right, and gaps are for explain_back and paste_check modes; set to null or omit in other modes.
+- quiz is an array of exactly 3 questions for quiz mode; set to null or omit in other modes.
 - Escape newlines and quotes inside strings properly.`;
 
 export function buildSystemPrompt(config: MentorConfig = DEFAULT_CONFIG, active: boolean = false): string {

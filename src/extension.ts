@@ -7,6 +7,7 @@ import {
   MentorReply,
   LineNote,
   ReviewFinding,
+  QuizQuestion,
   MissingApiKeyError,
   testApiConnection,
   DEFAULT_MODEL,
@@ -17,7 +18,10 @@ import {
   initProgress,
   saveConcepts,
   getConcepts,
-  clearConcepts
+  clearConcepts,
+  recordQuizResult,
+  getQuizResults,
+  QuizResult
 } from './progress';
 import {
   MentorConfig,
@@ -38,6 +42,7 @@ import {
   getActiveSession,
   setActiveSessionId,
   createNewSession,
+  generateSessionId,
   saveSession,
   deleteSession,
   clearAllSessions,
@@ -287,6 +292,14 @@ export async function activate(context: vscode.ExtensionContext) {
       await provider.showHistory();
     })
   );
+
+  // Quick Quiz command (Requirement 1): "Mentor: Quiz Me"
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mentor.startQuiz', async () => {
+      await vscode.commands.executeCommand('mentor.chat.focus');
+      await provider.startQuiz();
+    })
+  );
 }
 
 export function deactivate() {
@@ -306,7 +319,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   // Per-task state retained on the extension host
   private _currentLevel: 1 | 2 | 3 | 4 = 1;
   private _currentTaskText: string = '';
-  private _currentMode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' = 'task';
+  private _currentMode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' | 'quiz' = 'task';
 
   // Persistent session management (Requirements 1, 3, 5)
   private _activeSession: Session | null = null;
@@ -331,7 +344,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   // Last request cache for seamless Retry (Requirement C.2)
   private _lastRequest: {
     content: string;
-    mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check';
+    mode: 'task' | 'explain' | 'review' | 'explain_back' | 'paste_check' | 'quiz';
     hintLevel: number;
     learnerVisibleText?: string;
   } | null = null;
@@ -341,6 +354,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   private _pendingExplain: { fileName: string; languageId: string; code: string } | null = null;
   private _pendingReview: { fileName: string; languageId: string; code: string } | null = null;
   private _pendingPasteExplain: PasteEventPayload | null = null;
+  private _pendingStartQuiz: { forceIntermediate?: boolean } | null = null;
+  private _pastQuizQuestions: string[] = [];
   private _pendingNotice: string | null = null;
 
   constructor(
@@ -450,8 +465,12 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             isOnboarded: this._isOnboarded
           });
 
-          // Check command queues first (Requirement 8)
-          if (this._pendingResumeLastSession) {
+          // Check command queues first (Requirement 8 & Quick Quiz Entry Point)
+          if (this._pendingStartQuiz) {
+            const pending = this._pendingStartQuiz;
+            this._pendingStartQuiz = null;
+            await this.startQuiz(pending.forceIntermediate);
+          } else if (this._pendingResumeLastSession) {
             this._pendingResumeLastSession = false;
             await this.resumeLastSession();
           } else if (this._pendingShowHistory) {
@@ -519,6 +538,22 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           break;
         }
 
+        case 'startQuiz': {
+          if (this._isRequestInProgress) {
+            return;
+          }
+          await this._markOnboarded();
+          await this.startQuiz(Boolean(message.forceIntermediate));
+          break;
+        }
+
+        case 'quizCompleted': {
+          if (message.result) {
+            await this._handleQuizCompleted(message.result);
+          }
+          break;
+        }
+
         case 'explainBack': {
           if (this._isRequestInProgress) {
             return;
@@ -554,13 +589,22 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           if (this._isRequestInProgress || !this._lastRequest) {
             return;
           }
-          await this._executePrompt(
-            this._lastRequest.content,
-            this._lastRequest.mode,
-            this._lastRequest.hintLevel,
-            true, // isRetry
-            this._lastRequest.learnerVisibleText
-          );
+          if (this._lastRequest.mode === 'quiz') {
+            await this._executeQuizPrompt(
+              this._lastRequest.content,
+              'beginner',
+              this._lastRequest.learnerVisibleText,
+              true // isRetry
+            );
+          } else {
+            await this._executePrompt(
+              this._lastRequest.content,
+              this._lastRequest.mode,
+              this._lastRequest.hintLevel,
+              true, // isRetry
+              this._lastRequest.learnerVisibleText
+            );
+          }
           break;
         }
 
@@ -843,6 +887,569 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     const prompt = `Mode: review\nFile: ${fileName} (${languageId})\nCurrent file:\n${code}`;
     await this._executePrompt(prompt, 'review', 1, false, `Reviewing ${fileName}...`);
+  }
+
+  /**
+   * ===========================================================================
+   * QUICK QUIZ: ENTRY POINT & QUESTION GENERATION (Requirements 1, 2, 4)
+   * ===========================================================================
+   * Initiates a 3-question multiple-choice quiz based on the learner's active
+   * session concepts and currently open file code.
+   *
+   * @param forceIntermediate - Set to true when learner requests "Want something harder?" (3/3 score)
+   */
+  public async startQuiz(forceIntermediate: boolean = false): Promise<void> {
+    if (this._isRequestInProgress) {
+      return;
+    }
+
+    if (!this._view || !this._isWebviewReady) {
+      this._pendingStartQuiz = { forceIntermediate };
+      return;
+    }
+
+    await this._markOnboarded();
+
+    // 1. Session check: if no mentor replies and no active file, show in-chat notice and do NOT call LLM
+    const hasMentorReplies = this._history.some(m => m.role === 'assistant') ||
+      (this._activeSession?.messages?.some(m => m.role === 'assistant') ?? false);
+
+    const editor = vscode.window.activeTextEditor || vscode.window.visibleTextEditors[0];
+    const hasActiveFile = Boolean(editor && editor.document && editor.document.getText().trim().length > 0);
+
+    if (!hasMentorReplies && !hasActiveFile) {
+      this._postMessageToWebview({
+        type: 'noticeMessage',
+        text: 'Learn or build something first, then I can quiz you on it'
+      });
+      return;
+    }
+
+    // 2. Extract concepts so far: unique concept names from this session's assistant replies (max 10)
+    const conceptsSet = new Set<string>();
+    const sessionMessages = this._activeSession?.messages || [];
+    for (const msg of sessionMessages) {
+      if (msg.role === 'assistant' && msg.text && msg.mode !== 'quiz') {
+        try {
+          const parsed = parseMentorReply(msg.text);
+          if (Array.isArray(parsed.concept)) {
+            for (const c of parsed.concept) {
+              const clean = (c || '').trim();
+              if (clean) conceptsSet.add(clean);
+            }
+          }
+        } catch {
+          // Ignore parse errors on stored turns
+        }
+      }
+    }
+    for (const msg of this._history) {
+      if (msg.role === 'assistant' && msg.content) {
+        try {
+          const parsed = parseMentorReply(msg.content);
+          if (Array.isArray(parsed.concept)) {
+            for (const c of parsed.concept) {
+              const clean = (c || '').trim();
+              if (clean) conceptsSet.add(clean);
+            }
+          }
+        } catch {
+          // Ignore parse errors
+        }
+      }
+    }
+    const conceptsList = Array.from(conceptsSet).slice(0, 10);
+
+    // 3. Current file read at click time, truncated to ~300 lines or 'none'
+    let fileSection = 'none';
+    let fileName = '';
+    if (editor && editor.document) {
+      const doc = editor.document;
+      const fullText = doc.getText().trim();
+      fileName = path.basename(doc.fileName);
+      if (fullText) {
+        const totalLines = doc.lineCount;
+        let code = doc.getText();
+        if (totalLines > 300) {
+          const endLine = 299;
+          const endChar = doc.lineAt(endLine).text.length;
+          code = doc.getText(new vscode.Range(0, 0, endLine, endChar)) + '\n\n// ... (file truncated to 300 lines)';
+        }
+        fileSection = code;
+      }
+    }
+
+    // 4. Learner-side line in the chat: "Starting a quiz on <concept names or file name>..."
+    let quizTopic = '';
+    if (conceptsList.length > 0) {
+      quizTopic = conceptsList.slice(0, 3).join(', ');
+    } else if (fileName) {
+      quizTopic = fileName;
+    } else {
+      quizTopic = 'your code';
+    }
+    const learnerVisibleText = `Starting a quiz on ${quizTopic}...`;
+    this._postMessageToWebview({
+      type: 'userMessage',
+      text: learnerVisibleText
+    });
+
+    // 5. Build prompt parameters
+    const level = forceIntermediate
+      ? 'intermediate'
+      : (this._currentConfig.mode === 'intermediate' ? 'intermediate' : 'beginner');
+    const conceptsStr = conceptsList.length > 0 ? conceptsList.join(', ') : 'none';
+    const taskStr = this._currentTaskText || (this._activeSession?.originalTask) || 'none';
+    let learningObjectivesStr = 'none';
+    if (this._activeConfig && this._currentConfig.learningObjectives && this._currentConfig.learningObjectives.length > 0) {
+      learningObjectivesStr = this._currentConfig.learningObjectives.join(', ');
+    }
+    const doNotRepeatStr = this._pastQuizQuestions.slice(-6).join(' | ') || 'none';
+
+    // Exact prompt structure per Requirement 2
+    const prompt = `Mode: quiz\nLevel: ${level}\nConcepts so far: ${conceptsStr}\nTask: ${taskStr}\nLearning objectives: ${learningObjectivesStr}\nDo not repeat these questions: ${doNotRepeatStr}\nCurrent file:\n${fileSection}`;
+
+    await this._executeQuizPrompt(prompt, level, learnerVisibleText, false);
+  }
+
+  /**
+   * ===========================================================================
+   * QUIZ VALIDATION & SANITIZATION (Requirement 4 & Edge Cases)
+   * ===========================================================================
+   * - Validates exactly 3 items.
+   * - Each item has non-empty question, exactly 4 distinct non-empty options,
+   *   integer answer_index (0..3), non-empty explanation, non-empty concept.
+   * - Truncates "code" to 6 lines, or sets to null if not string.
+   * - Edge case: If instructor config is active, rejects items where code or
+   *   explanation contains > 12 lines of code.
+   */
+  private _validateAndSanitizeQuiz(quiz: any[] | undefined): QuizQuestion[] | null {
+    if (!Array.isArray(quiz) || quiz.length !== 3) {
+      return null;
+    }
+
+    const validated: QuizQuestion[] = [];
+
+    for (const item of quiz) {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+
+      const question = typeof item.question === 'string' ? item.question.trim() : '';
+      if (!question) {
+        return null;
+      }
+
+      if (!Array.isArray(item.options) || item.options.length !== 4) {
+        return null;
+      }
+
+      const options: string[] = item.options.map((opt: any) => typeof opt === 'string' ? opt.trim() : '');
+      if (options.some((opt: string) => opt.length === 0)) {
+        return null;
+      }
+
+      // Must be 4 distinct options
+      const distinctOptions = new Set(options);
+      if (distinctOptions.size !== 4) {
+        return null;
+      }
+
+      const answer_index = Number(item.answer_index);
+      if (!Number.isInteger(answer_index) || answer_index < 0 || answer_index > 3) {
+        return null;
+      }
+
+      const explanation = typeof item.explanation === 'string' ? item.explanation.trim() : '';
+      if (!explanation) {
+        return null;
+      }
+
+      const concept = typeof item.concept === 'string' ? item.concept.trim() : '';
+      if (!concept) {
+        return null;
+      }
+
+      // Truncate code to 6 lines; ignore if not a string
+      let code: string | null = null;
+      if (typeof item.code === 'string' && item.code.trim().length > 0) {
+        const lines = item.code.split(/\r?\n/);
+        code = lines.slice(0, 6).join('\n');
+      }
+
+      // Edge case: If instructor config limits help, ensure code/explanation <= 12 lines of code
+      if (this._activeConfig) {
+        if (code) {
+          const codeLines = code.split(/\r?\n/).length;
+          if (codeLines > 12) {
+            return null;
+          }
+        }
+        const codeBlockMatches = explanation.match(/```[\s\S]*?```/g);
+        if (codeBlockMatches) {
+          for (const block of codeBlockMatches) {
+            const blockLines = block.split(/\r?\n/).length;
+            if (blockLines > 12) {
+              return null;
+            }
+          }
+        }
+      }
+
+      validated.push({
+        question,
+        code,
+        options,
+        answer_index,
+        explanation,
+        concept
+      });
+    }
+
+    return validated;
+  }
+
+  /**
+   * ===========================================================================
+   * FISHER-YATES SHUFFLE & ANSWER_INDEX REMAPPING (Requirement 4)
+   * ===========================================================================
+   * Shuffles the four options of each question locally and remaps answer_index
+   * to where the correct option landed, because models tend to put the correct
+   * answer in position 0. Preserves the original explanation.
+   */
+  private _shuffleQuizOptions(questions: QuizQuestion[]): QuizQuestion[] {
+    return questions.map(q => {
+      const correctOption = q.options[q.answer_index];
+      const shuffledOptions = [...q.options];
+
+      // Fisher-Yates shuffle algorithm
+      for (let i = shuffledOptions.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const temp = shuffledOptions[i];
+        shuffledOptions[i] = shuffledOptions[j];
+        shuffledOptions[j] = temp;
+      }
+
+      // Remap answer_index to point to the correct option's new index
+      const newAnswerIndex = shuffledOptions.indexOf(correctOption);
+
+      return {
+        ...q,
+        options: shuffledOptions,
+        answer_index: newAnswerIndex
+      };
+    });
+  }
+
+  /**
+   * ===========================================================================
+   * SHARED QUIZ PROMPT EXECUTOR: RETRY ON INVALID JSON & ERROR MAPPING
+   * ===========================================================================
+   * Calls askMentor, validates against Quiz schema. If validation fails,
+   * automatically retries ONCE with clarification. If it fails again, shows a
+   * friendly error card with Retry button.
+   */
+  private async _executeQuizPrompt(
+    userMessageContent: string,
+    level: string,
+    learnerVisibleText?: string,
+    isRetry: boolean = false
+  ): Promise<void> {
+    if (!this._view) {
+      return;
+    }
+
+    const stagedUserText = (learnerVisibleText || userMessageContent).trim();
+
+    // Cache request for seamless Retry
+    this._lastRequest = {
+      content: userMessageContent,
+      mode: 'quiz',
+      hintLevel: 1,
+      learnerVisibleText: stagedUserText
+    };
+
+    this._isRequestInProgress = true;
+    this._isUserCancelled = false;
+    this._isTimeout = false;
+    this._currentMode = 'quiz';
+
+    this._currentAbortController = new AbortController();
+
+    const timeoutTimer = setTimeout(() => {
+      this._isTimeout = true;
+      this._currentAbortController?.abort();
+    }, 30000);
+
+    if (isRetry) {
+      this._postMessageToWebview({
+        type: 'userMessage',
+        text: 'Retrying quiz request...'
+      });
+    }
+
+    this._postMessageToWebview({
+      type: 'loading',
+      loading: true
+    });
+
+    const primaryModel = getResolvedModel();
+    let modelUsed = primaryModel;
+
+    try {
+      // 1. Initial attempt
+      let rawReply: string;
+      try {
+        rawReply = await askMentor(
+          [...this._history, { role: 'user', content: userMessageContent }],
+          this._currentConfig,
+          this._activeConfig,
+          this._currentAbortController.signal,
+          primaryModel
+        );
+      } catch (primaryError: any) {
+        const status = primaryError?.status;
+        const msg = primaryError?.message || '';
+        const fallbackModel = getResolvedFallbackModel();
+
+        const isModelNotFound = (status === 404) && (
+          (primaryModel && msg.toLowerCase().includes(primaryModel.toLowerCase())) ||
+          msg.toLowerCase().includes('not found for api version')
+        );
+
+        if (isModelNotFound && fallbackModel && fallbackModel !== primaryModel) {
+          logApiError(status, primaryModel, 'quiz', primaryError);
+          logChannel.appendLine(`[${new Date().toISOString()}] INFO: Primary model "${primaryModel}" not found. Retrying quiz with fallback model "${fallbackModel}"...`);
+
+          modelUsed = fallbackModel;
+          rawReply = await askMentor(
+            [...this._history, { role: 'user', content: userMessageContent }],
+            this._currentConfig,
+            this._activeConfig,
+            this._currentAbortController.signal,
+            fallbackModel
+          );
+        } else {
+          throw primaryError;
+        }
+      }
+
+      if (!rawReply || rawReply.trim().length === 0) {
+        throw new Error('EMPTY_RESPONSE');
+      }
+
+      let parsedReply = parseMentorReply(rawReply);
+      let validated = this._validateAndSanitizeQuiz(parsedReply.quiz);
+
+      // 2. Requirement 4: If validation fails, automatically retry ONCE with clarification
+      if (!validated) {
+        logChannel.appendLine(`[${new Date().toISOString()}] WARN: Quiz response failed validation on attempt 1. Retrying once with clarification...`);
+
+        const retryClarificationPrompt = `${userMessageContent}\n\nYour previous reply was not valid quiz JSON; return exactly 3 valid questions.`;
+        const retryRawReply = await askMentor(
+          [...this._history, { role: 'user', content: retryClarificationPrompt }],
+          this._currentConfig,
+          this._activeConfig,
+          this._currentAbortController.signal,
+          modelUsed
+        );
+
+        parsedReply = parseMentorReply(retryRawReply);
+        validated = this._validateAndSanitizeQuiz(parsedReply.quiz);
+      }
+
+      // If retry also failed, display friendly error card with Retry button
+      if (!validated) {
+        clearTimeout(timeoutTimer);
+        this._isRequestInProgress = false;
+        this._postMessageToWebview({ type: 'loading', loading: false });
+        this._postMessageToWebview({
+          type: 'friendlyError',
+          message: 'The AI service returned an invalid quiz. Click retry to try again.',
+          action: 'retry',
+          actionLabel: 'Retry'
+        });
+        return;
+      }
+
+      clearTimeout(timeoutTimer);
+
+      // 3. Requirement 4: Shuffle options locally (Fisher-Yates) and remap answer_index
+      const shuffledQuestions = this._shuffleQuizOptions(validated);
+
+      // Track questions to avoid repeating
+      for (const q of shuffledQuestions) {
+        this._pastQuizQuestions.push(q.question);
+      }
+      if (this._pastQuizQuestions.length > 6) {
+        this._pastQuizQuestions = this._pastQuizQuestions.slice(-6);
+      }
+
+      this._isRequestInProgress = false;
+      this._postMessageToWebview({ type: 'loading', loading: false });
+
+      // Post quiz card prompt to webview
+      this._postMessageToWebview({
+        type: 'quizPrompt',
+        quiz: shuffledQuestions,
+        level: level
+      });
+    } catch (error: any) {
+      clearTimeout(timeoutTimer);
+
+      if (this._isUserCancelled) {
+        logError('Quiz request was cancelled by learner');
+        this._postMessageToWebview({ type: 'requestCancelled' });
+        this._isRequestInProgress = false;
+        this._postMessageToWebview({ type: 'loading', loading: false });
+        return;
+      }
+
+      const status = error?.status;
+      const msg = error?.message || '';
+      logApiError(status, modelUsed, 'quiz', error);
+
+      let errorMessage = 'The AI service had a problem. Try again in a moment.';
+      let errorAction: 'openSettings' | 'retry' | 'none' = 'none';
+      let actionLabel = '';
+      let retryCountdown = 0;
+
+      const isModelNotFound = (status === 404) && (
+        (modelUsed && msg.toLowerCase().includes(modelUsed.toLowerCase())) ||
+        msg.toLowerCase().includes('not found for api version')
+      );
+
+      if (error instanceof MissingApiKeyError) {
+        errorMessage = 'Add your API key to get started.';
+        errorAction = 'openSettings';
+        actionLabel = 'Set API key';
+      } else if (
+        status === 400 ||
+        status === 401 ||
+        status === 403 ||
+        msg.includes('API_KEY_INVALID') ||
+        msg.includes('API key not valid')
+      ) {
+        errorMessage = 'Your API key was rejected. Check that it is correct and has access to the model.';
+        errorAction = 'openSettings';
+        actionLabel = 'Open settings';
+      } else if (isModelNotFound) {
+        errorMessage = 'The model name in settings was not found.';
+        errorAction = 'openSettings';
+        actionLabel = 'Open settings';
+      } else if (status === 404) {
+        let sanitizedSnippet = msg
+          .replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED]')
+          .replace(/AQ\.[0-9A-Za-z-_]{20,}/g, '[REDACTED]')
+          .replace(/sk-[0-9A-Za-z-_]{20,}/g, '[REDACTED]')
+          .replace(/key=[^&\s]+/gi, 'key=[REDACTED]')
+          .slice(0, 100)
+          .trim();
+        sanitizedSnippet = sanitizedSnippet.replace(/[:\-]+$/, '').trim();
+
+        errorMessage = sanitizedSnippet
+          ? `The AI service returned an error (404): ${sanitizedSnippet}`
+          : 'The AI service returned an error (404).';
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+      } else if (
+        status === 429 ||
+        msg.includes('429') ||
+        msg.includes('RESOURCE_EXHAUSTED') ||
+        msg.includes('quota')
+      ) {
+        errorMessage = "You're sending requests too fast or hit the free limit. Wait a minute and try again.";
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+        retryCountdown = 20;
+      } else if (this._isTimeout || msg.includes('timeout') || msg.includes('timed out')) {
+        errorMessage = 'That took too long.';
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+      } else if (
+        error?.code === 'ENOTFOUND' ||
+        error?.code === 'ECONNREFUSED' ||
+        msg.includes('fetch failed') ||
+        error?.name === 'APIConnectionError'
+      ) {
+        errorMessage = "Can't reach the AI service. Check your internet connection.";
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+      } else {
+        errorMessage = 'The AI service had a problem. Try again in a moment.';
+        errorAction = 'retry';
+        actionLabel = 'Retry';
+      }
+
+      this._isRequestInProgress = false;
+      this._postMessageToWebview({ type: 'loading', loading: false });
+
+      this._postMessageToWebview({
+        type: 'friendlyError',
+        message: errorMessage,
+        action: errorAction,
+        actionLabel: actionLabel,
+        countdown: retryCountdown
+      });
+    }
+  }
+
+  /**
+   * ===========================================================================
+   * QUIZ COMPLETION: EVIDENCE SAVING & SESSIONS INTEGRATION (Requirements 7 & 8)
+   * ===========================================================================
+   * Records evidence in globalState "mentor.quizResults" and appends a single
+   * compact StoredMessage with mode 'quiz' to the active session.
+   */
+  private async _handleQuizCompleted(result: {
+    total: number;
+    correct: number;
+    byConcept: Record<string, { correct: number; total: number }>;
+    missedConcepts: string[];
+  }): Promise<void> {
+    try {
+      const sessionId = this._activeSession ? this._activeSession.id : generateSessionId();
+
+      // 1. Requirement 7: Save finished quiz evidence in globalState
+      const quizResult: QuizResult = {
+        ts: new Date().toISOString(),
+        sessionId,
+        total: 3,
+        correct: result.correct,
+        byConcept: result.byConcept || {}
+      };
+      await recordQuizResult(quizResult, this._globalState);
+
+      // 2. Requirement 8: Append one compact StoredMessage to the active session
+      if (!this._activeSession) {
+        this._activeSession = createNewSession(
+          `Quiz (${result.correct}/3)`,
+          this._currentLevel,
+          this._currentTaskText
+        );
+        await setActiveSessionId(this._globalState, this._activeSession.id);
+      } else if (this._activeSession.messages.length === 0) {
+        // Update learner-visible title logic only if session has no other message
+        this._activeSession.title = `Quiz (${result.correct}/3)`;
+      }
+
+      const summaryPayload = {
+        correct: result.correct,
+        total: 3,
+        missedConcepts: result.missedConcepts || []
+      };
+
+      this._activeSession.messages.push({
+        role: 'assistant',
+        text: JSON.stringify(summaryPayload),
+        mode: 'quiz',
+        ts: new Date().toISOString()
+      });
+
+      await saveSession(this._globalState, this._activeSession);
+    } catch (err) {
+      console.error('Code Mentor: Failed to handle quiz completion:', err);
+    }
   }
 
   private async _handleExplainBack(learnerExplanation: string): Promise<void> {
@@ -2940,6 +3547,317 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     .continue-fresh-link:hover {
       text-decoration: underline;
     }
+
+    /* =============================================================
+       QUIZ CARD & RESULTS CARD STYLING (Requirements 5, 6, 9)
+       ============================================================= */
+    .quiz-card {
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
+      border-radius: 6px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      font-size: 12px;
+      line-height: 1.45;
+      max-width: 100%;
+      box-sizing: border-box;
+    }
+
+    .quiz-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.15));
+      padding-bottom: 6px;
+    }
+
+    .quiz-title-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      color: var(--vscode-textLink-foreground, inherit);
+      font-size: 12px;
+    }
+
+    .quiz-progress-label {
+      font-size: 10.5px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 10px;
+      background: var(--vscode-badge-background, rgba(128, 128, 128, 0.2));
+      color: var(--vscode-badge-foreground, inherit);
+      white-space: nowrap;
+    }
+
+    .quiz-question-text {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--vscode-editor-foreground, inherit);
+      line-height: 1.4;
+    }
+
+    .quiz-code-block {
+      background: var(--vscode-editor-background, rgba(0, 0, 0, 0.2));
+      border: 1px solid var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.2));
+      border-radius: 4px;
+      padding: 8px 10px;
+      overflow-x: auto;
+      max-width: 100%;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      line-height: 1.4;
+      white-space: pre;
+      margin: 0;
+    }
+
+    .quiz-options-group {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      margin-top: 2px;
+    }
+
+    .quiz-option {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 4px;
+      background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.12));
+      color: var(--vscode-button-secondaryForeground, inherit);
+      border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.25));
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+      line-height: 1.35;
+      outline: none;
+      transition: background 0.15s ease, border-color 0.15s ease;
+      word-break: break-word;
+    }
+
+    .quiz-option:hover:not(.locked) {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25));
+      border-color: var(--vscode-focusBorder, rgba(128, 128, 128, 0.5));
+    }
+
+    .quiz-option:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder, #007acc);
+      outline-offset: 1px;
+    }
+
+    .quiz-option.locked {
+      cursor: default;
+    }
+
+    .quiz-option-key {
+      font-weight: 700;
+      font-size: 10.5px;
+      background: rgba(128, 128, 128, 0.2);
+      border-radius: 3px;
+      padding: 1px 5px;
+      flex-shrink: 0;
+      line-height: 1.2;
+      margin-top: 1px;
+    }
+
+    .quiz-option-text {
+      flex: 1;
+    }
+
+    .quiz-option.selected-correct {
+      background: rgba(115, 201, 145, 0.15);
+      border-color: var(--vscode-testing-iconPassed, #73c991);
+    }
+
+    .quiz-option.selected-wrong {
+      background: rgba(241, 76, 76, 0.15);
+      border-color: var(--vscode-testing-iconFailed, #f14c4c);
+    }
+
+    .quiz-option.revealed-correct {
+      border-color: var(--vscode-testing-iconPassed, #73c991);
+      border-style: dashed;
+    }
+
+    .quiz-feedback-box {
+      margin-top: 4px;
+      padding: 8px 10px;
+      border-radius: 4px;
+      background: var(--vscode-input-background, rgba(128, 128, 128, 0.1));
+      border-left: 3px solid transparent;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .quiz-feedback-box.correct {
+      border-left-color: var(--vscode-testing-iconPassed, #73c991);
+    }
+
+    .quiz-feedback-box.incorrect {
+      border-left-color: var(--vscode-testing-iconFailed, #f14c4c);
+    }
+
+    .quiz-feedback-status {
+      font-weight: 700;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .quiz-feedback-status.correct {
+      color: var(--vscode-testing-iconPassed, #73c991);
+    }
+
+    .quiz-feedback-status.incorrect {
+      color: var(--vscode-testing-iconFailed, #f14c4c);
+    }
+
+    .quiz-feedback-correct-answer {
+      font-size: 11.5px;
+      opacity: 0.9;
+    }
+
+    .quiz-explanation-text {
+      font-size: 11.5px;
+      line-height: 1.45;
+      margin-top: 2px;
+    }
+
+    .quiz-footer-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+      flex-wrap: wrap;
+    }
+
+    .quiz-skip-link {
+      font-size: 11px;
+      color: var(--vscode-textLink-foreground, #3794ff);
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    .quiz-skip-link:hover {
+      text-decoration: underline;
+    }
+
+    /* Results Card */
+    .quiz-results-card {
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
+      border-radius: 6px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      font-size: 12px;
+    }
+
+    .quiz-results-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--vscode-textLink-foreground, inherit);
+    }
+
+    .quiz-results-sentence {
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .quiz-revisit-section {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    .quiz-revisit-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      opacity: 0.8;
+    }
+
+    .quiz-revisit-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .quiz-revisit-chip {
+      background: var(--vscode-badge-background, rgba(128, 128, 128, 0.2));
+      color: var(--vscode-textLink-foreground, inherit);
+      border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.3));
+      border-radius: 12px;
+      padding: 3px 8px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-family: inherit;
+    }
+
+    .quiz-revisit-chip:hover {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.3));
+    }
+
+    .quiz-results-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+
+    .quiz-summary-card {
+      background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.2));
+      border-radius: 5px;
+      padding: 8px 10px;
+      font-size: 11.5px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* Accessibility: prefers-reduced-motion and narrow layout (~250px) */
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+
+    @media (max-width: 270px) {
+      .header-actions {
+        gap: 2px;
+      }
+      .header-actions button {
+        padding: 2px 5px;
+        font-size: 10px;
+      }
+      .quiz-card {
+        padding: 8px 10px;
+      }
+      .quiz-option {
+        padding: 6px 8px;
+        font-size: 11.5px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -2954,6 +3872,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         <button id="history-toggle-btn" title="View past chat sessions" aria-label="View chat history">📜 History</button>
         <button id="progress-toggle-btn" title="View your learned concepts" aria-label="View learning progress">📊 Progress</button>
         <button id="review-code-btn" title="Review my current active file" aria-label="Review active file">🔍 Review</button>
+        <button id="quiz-me-btn" title="Take a quick quiz on concepts and your code" aria-label="Take quick quiz">🎯 Quiz me</button>
         <button id="new-task-btn" title="Clear conversation history and reset level to 1" aria-label="Start new task">+ New task</button>
       </div>
     </div>
@@ -3131,6 +4050,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     const cancelRequestBtn = document.getElementById('cancel-request-btn');
     const newTaskBtn = document.getElementById('new-task-btn');
     const reviewCodeBtn = document.getElementById('review-code-btn');
+    const quizMeBtn = document.getElementById('quiz-me-btn');
 
     // Progress elements
     const progressToggleBtn = document.getElementById('progress-toggle-btn');
@@ -3768,6 +4688,13 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: 'newTask' });
     });
 
+    if (quizMeBtn) {
+      quizMeBtn.addEventListener('click', function() {
+        if (isLoading) return;
+        vscode.postMessage({ type: 'startQuiz' });
+      });
+    }
+
     // -------------------------------------------------------------------------
     // INCOMING: Receiving messages from Extension Host in the Webview
     // -------------------------------------------------------------------------
@@ -3775,6 +4702,11 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       const message = event.data;
 
       switch (message.type) {
+        case 'quizPrompt': {
+          renderQuizCard(message.quiz, message.level);
+          break;
+        }
+
         case 'apiKeyStatus': {
           hasApiKey = message.hasApiKey;
           updateWelcomeCardUI();
@@ -3902,21 +4834,25 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
               if (msg.role === 'user') {
                 appendUserMessage(msg.text);
               } else if (msg.role === 'assistant') {
-                let parsed;
-                try {
-                  parsed = JSON.parse(msg.text);
-                } catch (e) {
-                  // Fallback if stored reply fails to parse
-                  parsed = {
-                    message: msg.text || '',
-                    concept: [],
-                    next_step: '',
-                    question: null,
-                    hint_level: session.hintLevel || 1
-                  };
+                if (msg.mode === 'quiz') {
+                  renderStoredQuizCard(msg.text);
+                } else {
+                  let parsed;
+                  try {
+                    parsed = JSON.parse(msg.text);
+                  } catch (e) {
+                    // Fallback if stored reply fails to parse
+                    parsed = {
+                      message: msg.text || '',
+                      concept: [],
+                      next_step: '',
+                      question: null,
+                      hint_level: session.hintLevel || 1
+                    };
+                  }
+                  const renderMode = msg.mode === 'chat' ? 'task' : msg.mode;
+                  renderMentorReplyCard(parsed, renderMode);
                 }
-                const renderMode = msg.mode === 'chat' ? 'task' : msg.mode;
-                renderMentorReplyCard(parsed, renderMode);
               }
             });
           }
@@ -3973,6 +4909,12 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     function setLoading(loading) {
       isLoading = loading;
       sendBtn.disabled = loading;
+      if (quizMeBtn) {
+        quizMeBtn.disabled = loading;
+      }
+      if (reviewCodeBtn) {
+        reviewCodeBtn.disabled = loading;
+      }
 
       // Disable hint buttons during loading (Requirement B.1)
       for (let i = 1; i <= 4; i++) {
@@ -4209,7 +5151,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       const isReviewMode = (mode === 'review');
       const isExplainBackMode = (mode === 'explain_back');
       const isPasteCheckMode = (mode === 'paste_check');
-      const hideLadderControls = isExplainMode || isReviewMode || isExplainBackMode || isPasteCheckMode;
+      const isQuizMode = (mode === 'quiz');
+      const hideLadderControls = isExplainMode || isReviewMode || isExplainBackMode || isPasteCheckMode || isQuizMode;
 
       const row = document.createElement('div');
       row.className = 'message-row mentor-row';
@@ -4618,6 +5561,426 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         case 4: return '4/4: Solution (full worked answer)';
         default: return 'Hint level ' + level;
       }
+    }
+
+    /**
+     * Requirement 8: Renders a compact summary card for a stored quiz turn on session restore.
+     * e.g. "Quiz result: 2 of 3 · Revisit: Flexbox"
+     */
+    function renderStoredQuizCard(text) {
+      let data = { correct: 0, total: 3, missedConcepts: [] };
+      try {
+        data = JSON.parse(text);
+      } catch (e) {}
+
+      const row = document.createElement('div');
+      row.className = 'message-row mentor-row';
+
+      const card = document.createElement('div');
+      card.className = 'quiz-summary-card';
+
+      const icon = document.createElement('span');
+      icon.textContent = '🎯';
+      card.appendChild(icon);
+
+      const textSpan = document.createElement('span');
+      let label = 'Quiz result: ' + (data.correct != null ? data.correct : 0) + ' of ' + (data.total || 3);
+      if (Array.isArray(data.missedConcepts) && data.missedConcepts.length > 0) {
+        label += ' · Revisit: ' + data.missedConcepts.join(', ');
+      } else if (data.correct === 3) {
+        label += ' · All concepts solid!';
+      }
+      textSpan.textContent = label;
+      card.appendChild(textSpan);
+
+      row.appendChild(card);
+      messagesContainer.appendChild(row);
+    }
+
+    /**
+     * Requirements 5 & 6: Renders the interactive 3-question Quick Quiz in the chat.
+     * - Card renders 1 question at a time with header progress text.
+     * - Code snippet displayed in <pre><code> with horizontal scroll.
+     * - Options in role="radiogroup" with role="radio" and aria-checked.
+     * - Keyboard navigation: Arrow keys move, Enter/Space selects, 1-4 selects directly.
+     * - Selecting an option locks question, reveals text label ("✓ Correct" or "✕ Not quite"),
+     *   correct answer when wrong, and explanation.
+     * - "Next" button (or "See results" on question 3).
+     * - "Skip quiz" link to dismiss without saving.
+     * - Results card with score encouragement, concepts to revisit chips (fill input on click),
+     *   and Retake / Harder buttons.
+     */
+    function renderQuizCard(quizQuestions, level) {
+      if (!Array.isArray(quizQuestions) || quizQuestions.length !== 3) {
+        return;
+      }
+
+      if (welcomeCard) {
+        welcomeCard.style.display = 'none';
+      }
+
+      hasReplies = true;
+      if (explainBackSection) {
+        explainBackSection.style.display = 'block';
+      }
+
+      let currentQuestionIndex = 0;
+      let score = 0;
+      const byConcept = {};
+      const missedConcepts = [];
+      let isAnswered = false;
+
+      const row = document.createElement('div');
+      row.className = 'message-row mentor-row';
+
+      const card = document.createElement('div');
+      card.className = 'quiz-card';
+      row.appendChild(card);
+      messagesContainer.appendChild(row);
+
+      function renderCurrentQuestion() {
+        card.innerHTML = '';
+        isAnswered = false;
+
+        const q = quizQuestions[currentQuestionIndex];
+
+        // 1. Header: "Quiz · Question N of 3" and progress text label
+        const header = document.createElement('div');
+        header.className = 'quiz-header';
+
+        const titleGroup = document.createElement('div');
+        titleGroup.className = 'quiz-title-group';
+        const iconSpan = document.createElement('span');
+        iconSpan.textContent = '🎯';
+        const titleSpan = document.createElement('span');
+        titleSpan.textContent = 'Quiz · Question ' + (currentQuestionIndex + 1) + ' of 3';
+        titleGroup.appendChild(iconSpan);
+        titleGroup.appendChild(titleSpan);
+        header.appendChild(titleGroup);
+
+        const progressLabel = document.createElement('span');
+        progressLabel.className = 'quiz-progress-label';
+        progressLabel.textContent = 'Question ' + (currentQuestionIndex + 1) + ' of 3';
+        header.appendChild(progressLabel);
+
+        card.appendChild(header);
+
+        // 2. Question text (escaped)
+        const questionText = document.createElement('div');
+        questionText.className = 'quiz-question-text';
+        questionText.textContent = q.question;
+        card.appendChild(questionText);
+
+        // 3. Optional code block (escaped, in <pre><code>, horizontal scroll)
+        if (q.code && typeof q.code === 'string' && q.code.trim()) {
+          const pre = document.createElement('pre');
+          pre.className = 'quiz-code-block';
+          const codeEl = document.createElement('code');
+          codeEl.textContent = q.code.trim();
+          pre.appendChild(codeEl);
+          card.appendChild(pre);
+        }
+
+        // 4. Four options as role="radiogroup" with role="radio" and aria-checked
+        const optionsGroup = document.createElement('div');
+        optionsGroup.className = 'quiz-options-group';
+        optionsGroup.setAttribute('role', 'radiogroup');
+        optionsGroup.setAttribute('aria-label', 'Answer options');
+
+        const optionEls = [];
+
+        q.options.forEach(function(optText, idx) {
+          const optionEl = document.createElement('div');
+          optionEl.className = 'quiz-option';
+          optionEl.setAttribute('role', 'radio');
+          optionEl.setAttribute('aria-checked', 'false');
+          optionEl.setAttribute('tabindex', idx === 0 ? '0' : '-1');
+          optionEl.setAttribute('data-index', String(idx));
+
+          const keyBadge = document.createElement('span');
+          keyBadge.className = 'quiz-option-key';
+          keyBadge.textContent = String(idx + 1);
+
+          const textSpan = document.createElement('span');
+          textSpan.className = 'quiz-option-text';
+          textSpan.textContent = optText;
+
+          optionEl.appendChild(keyBadge);
+          optionEl.appendChild(textSpan);
+
+          optionEl.addEventListener('click', function() {
+            if (!isAnswered) {
+              handleOptionSelect(idx);
+            }
+          });
+
+          optionEls.push(optionEl);
+          optionsGroup.appendChild(optionEl);
+        });
+
+        card.appendChild(optionsGroup);
+
+        // 5. Container for feedback & navigation
+        const feedbackContainer = document.createElement('div');
+        feedbackContainer.className = 'quiz-feedback-container';
+        card.appendChild(feedbackContainer);
+
+        const footer = document.createElement('div');
+        footer.className = 'quiz-footer-actions';
+
+        const skipLink = document.createElement('a');
+        skipLink.className = 'quiz-skip-link';
+        skipLink.href = '#';
+        skipLink.setAttribute('role', 'button');
+        skipLink.textContent = 'Skip quiz';
+        skipLink.addEventListener('click', function(e) {
+          e.preventDefault();
+          cleanupListeners();
+          row.remove();
+        });
+        footer.appendChild(skipLink);
+
+        const actionBtnContainer = document.createElement('div');
+        footer.appendChild(actionBtnContainer);
+
+        card.appendChild(footer);
+
+        // Keyboard handler for the options
+        function handleKeyDown(e) {
+          if (isAnswered) return;
+
+          // Keys 1 to 4: direct selection
+          if (e.key === '1' || e.key === '2' || e.key === '3' || e.key === '4') {
+            const idx = parseInt(e.key, 10) - 1;
+            if (idx >= 0 && idx < 4) {
+              e.preventDefault();
+              handleOptionSelect(idx);
+            }
+            return;
+          }
+
+          const focusedIndex = optionEls.findIndex(el => el === document.activeElement);
+
+          // Arrow navigation
+          if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+            e.preventDefault();
+            const nextIdx = focusedIndex >= 0 ? (focusedIndex + 1) % 4 : 0;
+            optionEls.forEach((el, i) => el.setAttribute('tabindex', i === nextIdx ? '0' : '-1'));
+            optionEls[nextIdx].focus();
+            return;
+          }
+
+          if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+            e.preventDefault();
+            const prevIdx = focusedIndex >= 0 ? (focusedIndex + 3) % 4 : 3;
+            optionEls.forEach((el, i) => el.setAttribute('tabindex', i === prevIdx ? '0' : '-1'));
+            optionEls[prevIdx].focus();
+            return;
+          }
+
+          // Enter or Space to select currently focused option
+          if ((e.key === 'Enter' || e.key === ' ') && focusedIndex >= 0) {
+            e.preventDefault();
+            handleOptionSelect(focusedIndex);
+            return;
+          }
+        }
+
+        function cleanupListeners() {
+          document.removeEventListener('keydown', handleKeyDown);
+        }
+
+        document.addEventListener('keydown', handleKeyDown);
+
+        function handleOptionSelect(chosenIndex) {
+          if (isAnswered) return;
+          isAnswered = true;
+          cleanupListeners();
+
+          const isCorrect = (chosenIndex === q.answer_index);
+          const conceptName = q.concept || 'General';
+
+          byConcept[conceptName] = byConcept[conceptName] || { correct: 0, total: 0 };
+          byConcept[conceptName].total++;
+
+          if (isCorrect) {
+            score++;
+            byConcept[conceptName].correct++;
+          } else {
+            missedConcepts.push(conceptName);
+          }
+
+          // Lock options and update visual feedback
+          optionEls.forEach(function(el, i) {
+            el.classList.add('locked');
+            el.setAttribute('tabindex', '-1');
+            if (i === chosenIndex) {
+              el.setAttribute('aria-checked', 'true');
+              if (isCorrect) {
+                el.classList.add('selected-correct');
+              } else {
+                el.classList.add('selected-wrong');
+              }
+            } else if (!isCorrect && i === q.answer_index) {
+              el.classList.add('revealed-correct');
+            }
+          });
+
+          // Feedback box with explicit TEXT label ("Correct" or "Not quite") and icon
+          const feedbackBox = document.createElement('div');
+          feedbackBox.className = 'quiz-feedback-box ' + (isCorrect ? 'correct' : 'incorrect');
+
+          const statusLabel = document.createElement('div');
+          statusLabel.className = 'quiz-feedback-status ' + (isCorrect ? 'correct' : 'incorrect');
+          statusLabel.textContent = isCorrect ? '✓ Correct' : '✕ Not quite';
+          feedbackBox.appendChild(statusLabel);
+
+          if (!isCorrect) {
+            const correctInfo = document.createElement('div');
+            correctInfo.className = 'quiz-feedback-correct-answer';
+            correctInfo.innerHTML = 'Correct answer: <strong>' + escapeHtml(q.options[q.answer_index]) + '</strong>';
+            feedbackBox.appendChild(correctInfo);
+          }
+
+          if (q.explanation) {
+            const explanationEl = document.createElement('div');
+            explanationEl.className = 'quiz-explanation-text';
+            explanationEl.textContent = q.explanation;
+            feedbackBox.appendChild(explanationEl);
+          }
+
+          feedbackContainer.appendChild(feedbackBox);
+
+          // Navigation button: Next or See results
+          const isLastQuestion = (currentQuestionIndex === 2);
+          const nextBtn = document.createElement('button');
+          nextBtn.type = 'button';
+          nextBtn.className = 'btn-action';
+          nextBtn.textContent = isLastQuestion ? 'See results →' : 'Next →';
+          nextBtn.addEventListener('click', function() {
+            if (isLastQuestion) {
+              renderResultsCard();
+            } else {
+              currentQuestionIndex++;
+              renderCurrentQuestion();
+            }
+          });
+
+          actionBtnContainer.appendChild(nextBtn);
+          nextBtn.focus();
+          scrollToBottom(true);
+        }
+
+        scrollToBottom(false);
+      }
+
+      function renderResultsCard() {
+        card.innerHTML = '';
+
+        const resultsHeader = document.createElement('div');
+        resultsHeader.className = 'quiz-results-header';
+        resultsHeader.innerHTML = '<span>🏆</span><span>You got ' + score + ' of 3</span>';
+        card.appendChild(resultsHeader);
+
+        let sentence = '';
+        if (score === 3) {
+          sentence = "Outstanding work! You've mastered all the concepts covered so far.";
+        } else if (score === 2) {
+          sentence = "Great progress! You have a solid grasp on these concepts with just a little review needed.";
+        } else {
+          sentence = "Good effort! Taking quizzes helps lock in what you've learned. Review the concepts below to build your confidence.";
+        }
+
+        const sentenceEl = document.createElement('div');
+        sentenceEl.className = 'quiz-results-sentence';
+        sentenceEl.textContent = sentence;
+        card.appendChild(sentenceEl);
+
+        const uniqueMissed = Array.from(new Set(missedConcepts));
+        if (uniqueMissed.length > 0) {
+          const revisitSec = document.createElement('div');
+          revisitSec.className = 'quiz-revisit-section';
+
+          const revisitLabel = document.createElement('div');
+          revisitLabel.className = 'quiz-revisit-label';
+          revisitLabel.textContent = 'Concepts to revisit:';
+          revisitSec.appendChild(revisitLabel);
+
+          const chipsWrap = document.createElement('div');
+          chipsWrap.className = 'quiz-revisit-chips';
+
+          uniqueMissed.forEach(function(concept) {
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = 'quiz-revisit-chip';
+            chip.textContent = '↻ ' + concept;
+            chip.title = 'Ask mentor to explain ' + concept;
+            chip.addEventListener('click', function() {
+              userInput.value = 'Can you explain ' + concept + ' again?';
+              userInput.style.height = 'auto';
+              userInput.style.height = Math.min(userInput.scrollHeight, 140) + 'px';
+              userInput.focus();
+            });
+            chipsWrap.appendChild(chip);
+          });
+
+          revisitSec.appendChild(chipsWrap);
+          card.appendChild(revisitSec);
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'quiz-results-actions';
+
+        const retakeBtn = document.createElement('button');
+        retakeBtn.type = 'button';
+        retakeBtn.className = 'btn-action';
+        retakeBtn.textContent = 'Retake with new questions';
+        retakeBtn.addEventListener('click', function() {
+          vscode.postMessage({ type: 'startQuiz' });
+        });
+        actions.appendChild(retakeBtn);
+
+        const backBtn = document.createElement('button');
+        backBtn.type = 'button';
+        backBtn.className = 'cancel-btn';
+        backBtn.textContent = 'Back to chat';
+        backBtn.addEventListener('click', function() {
+          userInput.focus();
+          scrollToBottom(true);
+        });
+        actions.appendChild(backBtn);
+
+        // Requirement 6: If score is 3/3, show "Nice work. Want something harder?" button
+        if (score === 3) {
+          const harderBtn = document.createElement('button');
+          harderBtn.type = 'button';
+          harderBtn.className = 'btn-action';
+          harderBtn.textContent = 'Nice work. Want something harder?';
+          harderBtn.title = 'Start intermediate level quiz';
+          harderBtn.addEventListener('click', function() {
+            vscode.postMessage({ type: 'startQuiz', forceIntermediate: true });
+          });
+          actions.appendChild(harderBtn);
+        }
+
+        card.appendChild(actions);
+
+        // Requirement 7: Post completed quiz evidence to extension host
+        vscode.postMessage({
+          type: 'quizCompleted',
+          result: {
+            total: 3,
+            correct: score,
+            byConcept: byConcept,
+            missedConcepts: uniqueMissed
+          }
+        });
+
+        scrollToBottom(true);
+      }
+
+      // Start by rendering Question 1
+      renderCurrentQuestion();
     }
 
     // Requirement D.7: Smart scroll that does not jump if user scrolled up

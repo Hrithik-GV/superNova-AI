@@ -35,7 +35,8 @@
     "onCommand:mentor.testConnection",
     "onCommand:mentor.showLogs",
     "onCommand:mentor.resumeLastSession",
-    "onCommand:mentor.showHistory"
+    "onCommand:mentor.showHistory",
+    "onCommand:mentor.startQuiz"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -89,6 +90,10 @@
       {
         "command": "mentor.showHistory",
         "title": "Mentor: Show Chat History"
+      },
+      {
+        "command": "mentor.startQuiz",
+        "title": "Mentor: Quiz Me"
       }
     ],
     "menus": {
