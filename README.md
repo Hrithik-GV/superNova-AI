@@ -77,17 +77,14 @@ The LLM is strictly constrained never to provide complete solutions on initial r
 
 ---
 
-## Installation
+## Install (2 minutes)
 
-### From VSIX Package
-
-1. Download or locate the packaged file: `polaris-0.1.0.vsix`.
-2. Open VS Code (or your compatible editor fork such as Google Antigravity / Cursor / VSCodium).
-3. Open the **Extensions** view (`Ctrl+Shift+X` on Windows/Linux, `Cmd+Shift+X` on macOS).
-4. Click the **Views and More Actions (`...`)** menu in the top-right corner of the Extensions sidebar.
-5. Select **Install from VSIX...**.
-6. Select `polaris-0.1.0.vsix` and click **Install**.
-7. Polaris will appear in your Activity Bar with a guiding star icon.
+1. Download `polaris-0.1.0.vsix` from the [latest release](https://github.com/Mohith824/polaris/releases/latest).
+2. In VS Code (or Antigravity, Cursor and other forks): open the Extensions view → click the `...` menu → **Install from VSIX...** → choose the file.
+3. Get a free API key from [Google AI Studio](https://aistudio.google.com/).
+4. Open Settings, search `mentor.apiKey`, and paste your key. (Optionally set `mentor.model` to a current Flash model ID from AI Studio.)
+5. Click the Polaris star in the activity bar and ask for something to build.
+6. Run **Polaris: Test API Connection** if anything fails.
 
 ---
 
