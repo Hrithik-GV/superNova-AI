@@ -4,8 +4,6 @@
 
 Built by Team Supernova
 
-[![Demo Video Placeholder](https://img.shields.io/badge/Demo%20Video-Watch%202--Min%20Walkthrough-blue?style=for-the-badge&logo=youtube)](TODO: INSERT DEMO VIDEO URL HERE)
-
 ---
 
 ## The Problem
