@@ -174,7 +174,7 @@ export function registerPasteDetector(
       }
     } catch (err) {
       // Guard against any unhandled exceptions interrupting the editor
-      console.error('Code Mentor: Error during paste detection:', err);
+      console.error('Polaris: Error during paste detection:', err);
     }
   });
 

@@ -1,7 +1,7 @@
 {
-  "name": "code-mentor",
-  "displayName": "Code Mentor",
-  "description": "An AI coding mentor for beginners that teaches instead of generating code.",
+  "name": "polaris",
+  "displayName": "Polaris",
+  "description": "A guiding-star coding mentor that teaches you to build web interfaces by guiding, questioning and checking your understanding, instead of writing the code for you.",
   "version": "0.1.0",
   "publisher": "code-mentor-team",
   "license": "MIT",
@@ -18,10 +18,11 @@
     "Other"
   ],
   "keywords": [
-    "ai",
+    "polaris",
+    "learning",
     "mentor",
     "education",
-    "learning",
+    "ai",
     "tutor",
     "beginner",
     "web development"
@@ -46,7 +47,7 @@
       "activitybar": [
         {
           "id": "mentor",
-          "title": "Code Mentor",
+          "title": "Polaris",
           "icon": "resources/mentor-icon.svg"
         }
       ]
@@ -56,54 +57,54 @@
         {
           "type": "webview",
           "id": "mentor.chat",
-          "name": "Mentor Chat"
+          "name": "Polaris"
         }
       ]
     },
     "commands": [
       {
         "command": "mentor.openChat",
-        "title": "Code Mentor: Open Chat"
+        "title": "Polaris: Open Chat"
       },
       {
         "command": "mentor.explainSelection",
-        "title": "Mentor: Explain Selection"
+        "title": "Polaris: Explain Selection"
       },
       {
         "command": "mentor.reviewFile",
-        "title": "Mentor: Review My Code"
+        "title": "Polaris: Review My Code"
       },
       {
         "command": "mentor.createConfig",
-        "title": "Mentor: Create Course Config (.mentor.json)"
+        "title": "Polaris: Create Course Config (.mentor.json)"
       },
       {
         "command": "mentor.testConnection",
-        "title": "Mentor: Test API Connection"
+        "title": "Polaris: Test API Connection"
       },
       {
         "command": "mentor.showLogs",
-        "title": "Mentor: Show Logs"
+        "title": "Polaris: Show Logs"
       },
       {
         "command": "mentor.resumeLastSession",
-        "title": "Mentor: Resume Last Session"
+        "title": "Polaris: Resume Last Session"
       },
       {
         "command": "mentor.showHistory",
-        "title": "Mentor: Show Chat History"
+        "title": "Polaris: Show Chat History"
       },
       {
         "command": "mentor.startQuiz",
-        "title": "Mentor: Quiz Me"
+        "title": "Polaris: Quiz Me"
       },
       {
         "command": "mentor.reviewStructure",
-        "title": "Mentor: Review Project Structure"
+        "title": "Polaris: Review Project Structure"
       },
       {
         "command": "mentor.resetAllData",
-        "title": "Mentor: Reset All Data"
+        "title": "Polaris: Reset All Data"
       }
     ],
     "menus": {
@@ -116,12 +117,12 @@
       ]
     },
     "configuration": {
-      "title": "Code Mentor",
+      "title": "Polaris",
       "properties": {
         "mentor.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Google Gemini API key for Code Mentor (e.g. from Google AI Studio)."
+          "description": "Google Gemini API key for Polaris (e.g. from Google AI Studio)."
         },
         "mentor.model": {
           "type": "string",

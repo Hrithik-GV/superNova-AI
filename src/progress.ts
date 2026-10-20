@@ -60,7 +60,7 @@ export function setProgressLogger(logger: (msg: string, err?: any) => void): voi
 }
 
 function logProgressError(msg: string, err?: any): void {
-  console.error(`Code Mentor: ${msg}`, err !== undefined ? err : '');
+  console.error(`Polaris: ${msg}`, err !== undefined ? err : '');
   if (_logger) {
     _logger(msg, err);
   }

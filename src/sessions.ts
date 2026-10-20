@@ -52,7 +52,7 @@ export function setSessionLogger(logger: (msg: string, err?: any) => void): void
 }
 
 function logSessionError(msg: string, err?: any): void {
-  console.error(`Code Mentor: ${msg}`, err !== undefined ? err : '');
+  console.error(`Polaris: ${msg}`, err !== undefined ? err : '');
   if (_logger) {
     _logger(msg, err);
   }

@@ -143,8 +143,8 @@ function hasApiKeyConfigured(): boolean {
  * Sets up provider, commands, watchers, and listeners.
  */
 export async function activate(context: vscode.ExtensionContext) {
-  // 1. Create OutputChannel named "Code Mentor" (Requirement E.1)
-  logChannel = vscode.window.createOutputChannel('Code Mentor');
+  // 1. Create OutputChannel named "Polaris" (Requirement E.1)
+  logChannel = vscode.window.createOutputChannel('Polaris');
   context.subscriptions.push(logChannel);
 
   // Hook up diagnostic loggers to "Code Mentor" output channel
@@ -262,15 +262,15 @@ export async function activate(context: vscode.ExtensionContext) {
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: 'Code Mentor: Testing Gemini API connection...'
+          title: 'Polaris: Testing Gemini API connection...'
         },
         async () => {
           const res = await testApiConnection();
           if (res.success) {
-            vscode.window.showInformationMessage(`Code Mentor: ${res.message}`);
+            vscode.window.showInformationMessage(`Polaris: ${res.message}`);
           } else {
             logApiError(res.status, res.modelUsed, 'testConnection', res.errorBody || res.message);
-            vscode.window.showErrorMessage(`Code Mentor: ${res.message}`);
+            vscode.window.showErrorMessage(`Polaris: ${res.message}`);
           }
         }
       );
@@ -325,7 +325,7 @@ export async function activate(context: vscode.ExtensionContext) {
           { label: 'Cancel', description: 'Keep current data' }
         ],
         {
-          placeHolder: 'Are you sure you want to reset all Code Mentor data? This cannot be undone.'
+          placeHolder: 'Are you sure you want to reset all Polaris data? This cannot be undone.'
         }
       );
 
@@ -339,10 +339,10 @@ export async function activate(context: vscode.ExtensionContext) {
         await clearQuizResults(context.globalState);
         await context.globalState.update('mentor.onboarded', false);
         await provider.resetAllData();
-        vscode.window.showInformationMessage('Code Mentor: All sessions, concepts, quiz results, and onboarding data have been reset.');
+        vscode.window.showInformationMessage('Polaris: All sessions, concepts, quiz results, and onboarding data have been reset.');
       } catch (err) {
         logError('Failed to reset all data:', err);
-        vscode.window.showErrorMessage('Code Mentor: Failed to reset all data.');
+        vscode.window.showErrorMessage('Polaris: Failed to reset all data.');
       }
     })
   );
@@ -1943,7 +1943,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       await saveSession(this._globalState, this._activeSession);
     } catch (err) {
-      console.error('Code Mentor: Failed to handle quiz completion:', err);
+      console.error('Polaris: Failed to handle quiz completion:', err);
     }
   }
 
@@ -2226,7 +2226,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         await saveSession(this._globalState, this._activeSession);
       } catch (storageErr) {
         // Storage errors must never disrupt the chat experience
-        console.error('Code Mentor: Failed to persist active session turn:', storageErr);
+        console.error('Polaris: Failed to persist active session turn:', storageErr);
       }
 
       this._postMessageToWebview({
@@ -2394,7 +2394,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         sessions: formatted
       });
     } catch (err) {
-      console.error('Code Mentor: Failed to post sessions list:', err);
+      console.error('Polaris: Failed to post sessions list:', err);
     }
   }
 
@@ -2418,7 +2418,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         });
       }
     } catch (err) {
-      console.error('Code Mentor: Failed to check and post welcome continue card:', err);
+      console.error('Polaris: Failed to check and post welcome continue card:', err);
     }
   }
 
@@ -2505,7 +2505,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         });
       }
     } catch (err) {
-      console.error('Code Mentor: Failed to resume last session:', err);
+      console.error('Polaris: Failed to resume last session:', err);
     }
   }
 
@@ -2573,7 +2573,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
-  <title>Code Mentor</title>
+  <title>Polaris</title>
   <style>
     :root {
       --font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif);
@@ -4619,13 +4619,13 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   <div class="chat-header">
     <div class="header-top-row">
       <div class="header-title">
-        <span>Code Mentor</span>
+        <span>POLARIS</span>
       </div>
       <div class="header-actions">
         <button id="history-toggle-btn" title="View past chat sessions" aria-label="View chat history" aria-pressed="false">📜 History</button>
         <button id="progress-toggle-btn" title="View your learned concepts" aria-label="View learning progress" aria-pressed="false">📊 Progress</button>
         <button id="plan-first-btn" title="Outline your plan before writing code" aria-label="Plan it first">📋 Plan it first</button>
-        <button id="review-structure-btn" title="Mentor: Review Project Structure" aria-label="Review project structure">🏗️ Structure</button>
+        <button id="review-structure-btn" title="Polaris: Review Project Structure" aria-label="Review project structure">🏗️ Structure</button>
         <button id="review-code-btn" title="Review my current active file" aria-label="Review active file">🔍 Review</button>
         <button id="quiz-me-btn" title="Take a quick quiz on concepts and your code" aria-label="Take quick quiz">🎯 Quiz me</button>
         <button id="new-task-btn" title="Clear conversation history and reset level to 1" aria-label="Start new task">+ New task</button>
@@ -4646,8 +4646,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     <!-- Onboarding / Welcome Card (Requirement A) -->
     <div class="welcome-card" id="welcome-card">
       <div id="welcome-normal-content">
-        <h3>👋 Welcome to Code Mentor!</h3>
-        <p class="welcome-tagline">I help you learn by guiding you, not by writing everything for you.</p>
+        <h3>👋 Welcome to Polaris!</h3>
+        <p class="welcome-tagline">Your guiding star: I show you the way, you take the steps.</p>
 
         <!-- Continue Card on Welcome Screen (Requirement 7) -->
         <div class="continue-card" id="welcome-continue-card" style="display: none;">
@@ -4685,7 +4685,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
       <!-- Setup Box when no API Key is set (Requirement A.2) -->
       <div class="setup-box" id="welcome-setup-box" style="display: none;">
         <div class="setup-box-title">🔑 Set Up Your Gemini API Key</div>
-        <div class="setup-box-hint">Get a free API key at Google AI Studio (<a href="https://aistudio.google.com" style="color: inherit;">aistudio.google.com</a>) to begin chatting with your mentor.</div>
+        <div class="setup-box-hint">Get a free API key at Google AI Studio (<a href="https://aistudio.google.com" style="color: inherit;">aistudio.google.com</a>) to begin chatting with Polaris.</div>
         <button type="button" class="btn-action" id="welcome-set-key-btn">Set API key</button>
       </div>
     </div>
@@ -4748,7 +4748,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         <span></span>
         <span></span>
       </div>
-      <span>Mentor is thinking...</span>
+      <span>Polaris is thinking...</span>
     </div>
     <button type="button" class="cancel-btn" id="cancel-request-btn" aria-label="Cancel thinking request">Cancel (Esc)</button>
   </div>
@@ -4807,7 +4807,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
     <!-- User Input Wrapper -->
     <div class="input-wrapper">
-      <textarea id="user-input" placeholder="Ask your mentor a question... (Enter to send, Shift+Enter for newline)"></textarea>
+      <textarea id="user-input" placeholder="Ask Polaris a question... (Enter to send, Shift+Enter for newline)"></textarea>
       <div class="input-controls">
         <span class="hint-label">Editor context included</span>
         <button id="send-btn" aria-label="Send message">Send</button>
@@ -5768,7 +5768,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
           explainCharCount.textContent = '0 / 15 chars min';
         }
 
-        appendUserMessage('Explaining my understanding:\n' + text);
+        appendUserMessage('Explaining my understanding:\\n' + text);
 
         vscode.postMessage({
           type: 'explainBack',
@@ -6512,22 +6512,22 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
 
       if (isExplainMode) {
         iconSpan.textContent = '🔍';
-        nameSpan.textContent = 'Code Mentor (Explain)';
+        nameSpan.textContent = 'Polaris (Explain)';
       } else if (isReviewMode) {
         iconSpan.textContent = '📋';
-        nameSpan.textContent = 'Code Mentor (Review)';
+        nameSpan.textContent = 'Polaris (Review)';
       } else if (isPlanReviewMode) {
         iconSpan.textContent = '📋';
-        nameSpan.textContent = 'Code Mentor (Plan Review)';
+        nameSpan.textContent = 'Polaris (Plan Review)';
       } else if (isArchitectureMode) {
         iconSpan.textContent = '🏗️';
-        nameSpan.textContent = 'Code Mentor (Architecture)';
+        nameSpan.textContent = 'Polaris (Architecture)';
       } else if (isExplainBackMode || isPasteCheckMode) {
         iconSpan.textContent = '🎯';
-        nameSpan.textContent = 'Code Mentor (Understanding Check)';
+        nameSpan.textContent = 'Polaris (Understanding Check)';
       } else {
         iconSpan.textContent = '🎓';
-        nameSpan.textContent = 'Code Mentor';
+        nameSpan.textContent = 'Polaris';
       }
 
       titleGroup.appendChild(iconSpan);
@@ -7278,7 +7278,7 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
             chip.type = 'button';
             chip.className = 'quiz-revisit-chip';
             chip.textContent = '↻ ' + concept;
-            chip.title = 'Ask mentor to explain ' + concept;
+            chip.title = 'Ask Polaris to explain ' + concept;
             chip.addEventListener('click', function() {
               showView('chat');
               userInput.value = 'Can you explain ' + concept + ' again?';

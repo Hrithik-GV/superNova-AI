@@ -1,6 +1,8 @@
-# Code Mentor
+# Polaris
 
-> An AI coding mentor for beginners that teaches instead of generating code.
+> A guiding-star coding mentor for web developers in training
+
+Built by Team Supernova
 
 [![Demo Video Placeholder](https://img.shields.io/badge/Demo%20Video-Watch%202--Min%20Walkthrough-blue?style=for-the-badge&logo=youtube)](TODO: INSERT DEMO VIDEO URL HERE)
 
@@ -10,30 +12,30 @@
 
 Modern AI coding assistants (like Copilot and ChatGPT) are designed to generate entire blocks of code on demand. For seasoned engineers, this accelerates development. For beginners, it does the exact opposite: learners copy and paste solutions they do not understand, skip critical cognitive struggle, and fail to build mental models or problem-solving instincts. When tests or technical interviews arrive, they cannot write code without AI assistance.
 
-## What Code Mentor Does Differently
+## What Polaris Does Differently
 
-Code Mentor acts like a patient human instructor sitting right beside you in VS Code. Instead of writing code for you, it asks guiding questions, explains foundational concepts using plain English analogies, and breaks challenges down into small, digestible steps. It enforces a strict pedagogical rule set: it never dumps full solutions on the first ask, provides a four-level progressive hint ladder, checks your understanding through active recall ("Explain it back"), and gently detects large code pastes to ensure you actually understand what you're placing into your project.
+Polaris acts like a patient human instructor sitting right beside you in VS Code. Instead of writing code for you, it asks guiding questions, explains foundational concepts using plain English analogies, and breaks challenges down into small, digestible steps. It enforces a strict pedagogical rule set: it never dumps full solutions on the first ask, provides a four-level progressive hint ladder, checks your understanding through active recall ("Explain it back"), and gently detects large code pastes to ensure you actually understand what you're placing into your project.
 
 ---
 
 ## Features
 
 - **Pedagogical Mentor Chat with Structured Replies**: Chat interface delivering cleanly structured cards featuring key concept tags, single next steps, guiding questions, and focused code snippets.
-  - *TODO: Insert screenshot of mentor chat interface (`resources/screenshots/chat.png`)*
+  - *TODO: retake screenshot - Polaris chat interface (`resources/screenshots/chat.png`)*
 - **Four-Level Hint Ladder**: Progressively unlock help from Level 1 (conceptual nudge), Level 2 (targeted hint), Level 3 (code structure/skeleton), to Level 4 (complete annotated solution).
-  - *TODO: Insert screenshot of hint ladder buttons (`resources/screenshots/hint-ladder.png`)*
+  - *TODO: retake screenshot - hint ladder buttons (`resources/screenshots/hint-ladder.png`)*
 - **Explain Selection**: Highlight code and right-click to receive an approachable overview, line-by-line concept breakdown notes, and a comprehension check question.
-  - *TODO: Insert screenshot of Explain Selection view (`resources/screenshots/explain-selection.png`)*
+  - *TODO: retake screenshot - Explain Selection view (`resources/screenshots/explain-selection.png`)*
 - **Review My Code**: Request a holistic, constructive code review that praises solid structure and surfaces guiding questions instead of rewriting your file.
-  - *TODO: Insert screenshot of Review My Code cards (`resources/screenshots/code-review.png`)*
+  - *TODO: retake screenshot - Review My Code cards (`resources/screenshots/code-review.png`)*
 - **Explain It Back (Active Recall)**: Test your comprehension by explaining your code back to the mentor, receiving an objective assessment ("solid", "partial", or "shaky") with praise and identified knowledge gaps.
-  - *TODO: Insert screenshot of Explain It Back evaluation (`resources/screenshots/explain-back.png`)*
+  - *TODO: retake screenshot - Explain It Back evaluation (`resources/screenshots/explain-back.png`)*
 - **Non-Intrusive Paste Detection**: Monitors clipboard pastes exceeding threshold limits (e.g. 5+ lines) and prompts you to explain what the code does or have it explained.
-  - *TODO: Insert screenshot of paste detection prompt (`resources/screenshots/paste-detection.png`)*
+  - *TODO: retake screenshot - paste detection prompt (`resources/screenshots/paste-detection.png`)*
 - **Instructor Course Configuration (`.mentor.json`)**: Educators can lock maximum hint levels, tune explanation depth, target specific learning objectives, and configure paste sensitivity.
-  - *TODO: Insert screenshot of .mentor.json in editor (`resources/screenshots/instructor-config.png`)*
+  - *TODO: retake screenshot - .mentor.json in editor (`resources/screenshots/instructor-config.png`)*
 - **Concept Tracking**: Automatically extracts core web development concepts covered during sessions and records frequency and timestamps in VS Code's local storage.
-  - *TODO: Insert screenshot of tracked concepts badge list (`resources/screenshots/concept-tracking.png`)*
+  - *TODO: retake screenshot - tracked concepts badge list (`resources/screenshots/concept-tracking.png`)*
 
 ---
 
@@ -79,19 +81,19 @@ The LLM is strictly constrained never to provide complete solutions on initial r
 
 ### From VSIX Package
 
-1. Download or locate the packaged file: `code-mentor-0.1.0.vsix`.
+1. Download or locate the packaged file: `polaris-0.1.0.vsix`.
 2. Open VS Code (or your compatible editor fork such as Google Antigravity / Cursor / VSCodium).
 3. Open the **Extensions** view (`Ctrl+Shift+X` on Windows/Linux, `Cmd+Shift+X` on macOS).
 4. Click the **Views and More Actions (`...`)** menu in the top-right corner of the Extensions sidebar.
 5. Select **Install from VSIX...**.
-6. Select `code-mentor-0.1.0.vsix` and click **Install**.
-7. Code Mentor will appear in your Activity Bar with a graduation cap icon.
+6. Select `polaris-0.1.0.vsix` and click **Install**.
+7. Polaris will appear in your Activity Bar with a guiding star icon.
 
 ---
 
 ## Setup
 
-Code Mentor communicates directly with Google's Gemini API (e.g. `gemini-3.5-flash-lite` or `gemini-flash-lite-latest`), which provides a generous free tier for developers and students.
+Polaris communicates directly with Google's Gemini API (e.g. `gemini-3.5-flash-lite` or `gemini-flash-lite-latest`), which provides a generous free tier for developers and students.
 
 1. **Get an API Key**:
    - Visit [Google AI Studio](https://aistudio.google.com/).
@@ -99,19 +101,19 @@ Code Mentor communicates directly with Google's Gemini API (e.g. `gemini-3.5-fla
    - Create a free API key and copy it to your clipboard.
 2. **Configure Settings**:
    - In VS Code, open Settings (`Ctrl+,` or `Cmd+,`).
-   - Search for `Code Mentor` (or `mentor.apiKey`).
-   - Paste your key into **Mentor: Api Key** (`mentor.apiKey`).
-   - *(Optional)* Adjust **Mentor: Model** (`mentor.model`) to your preferred model (default: `gemini-3.5-flash-lite`).
+   - Search for `Polaris` (or `mentor.apiKey`).
+   - Paste your key into **Polaris: Api Key** (`mentor.apiKey`).
+   - *(Optional)* Adjust **Polaris: Model** (`mentor.model`) to your preferred model (default: `gemini-3.5-flash-lite`).
 3. **Verify Connection**:
    - Open the Command Palette (`Ctrl+Shift+P` or `Cmd+Shift+P`).
-   - Run **Mentor: Test API Connection**.
-   - You should see a notification confirming: *"Code Mentor: Successfully connected to gemini-3.5-flash-lite!"*.
+   - Run **Polaris: Test API Connection**.
+   - You should see a notification confirming: *"Polaris: Successfully connected to gemini-3.5-flash-lite!"*.
 
 ---
 
 ## Quick Start (Judge 2-Minute Demo)
 
-1. **Open the Mentor Sidebar**: Click the graduation cap icon in the Activity Bar or press `Ctrl+Shift+P` / `Cmd+Shift+P` and execute `Code Mentor: Open Chat`.
+1. **Open the Mentor Sidebar**: Click the guiding star icon in the Activity Bar or press `Ctrl+Shift+P` / `Cmd+Shift+P` and execute `Polaris: Open Chat`.
 2. **Create a Test File**: Create a new file named `app.js` or `index.html`.
 3. **Ask a Learning Question**: In the chat box, type:
    > *"How do I center a card horizontally and vertically on my webpage?"*
@@ -124,17 +126,17 @@ Code Mentor communicates directly with Google's Gemini API (e.g. `gemini-3.5-fla
      const items = [1, 2, 3];
      const doubled = items.map(x => x * 2);
      ```
-   - Highlight the lines, right-click, and choose **Mentor: Explain Selection**.
+   - Highlight the lines, right-click, and choose **Polaris: Explain Selection**.
    - Inspect the broken-down line notes, concept badges, and comprehension check question!
 
 ---
 
 ## Instructor Configuration (`.mentor.json`)
 
-Instructors can customize Code Mentor for their specific course or assignment by placing a `.mentor.json` file in the root of the student workspace repository.
+Instructors can customize Polaris for their specific course or assignment by placing a `.mentor.json` file in the root of the student workspace repository.
 
 To generate a sample configuration file, open the Command Palette and run:
-`Mentor: Create Course Config (.mentor.json)`
+`Polaris: Create Course Config (.mentor.json)`
 
 ### Sample Configuration
 

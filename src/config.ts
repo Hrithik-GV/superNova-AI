@@ -75,12 +75,12 @@ export async function loadConfig(): Promise<{ config: MentorConfig; active: bool
   try {
     parsed = JSON.parse(rawText);
   } catch {
-    vscode.window.showWarningMessage('Code Mentor: Failed to parse .mentor.json (invalid JSON syntax). Falling back to default settings.');
+    vscode.window.showWarningMessage('Polaris: Failed to parse .mentor.json (invalid JSON syntax). Falling back to default settings.');
     return { config: { ...DEFAULT_CONFIG }, active: false };
   }
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    vscode.window.showWarningMessage('Code Mentor: .mentor.json must contain a JSON object. Falling back to default settings.');
+    vscode.window.showWarningMessage('Polaris: .mentor.json must contain a JSON object. Falling back to default settings.');
     return { config: { ...DEFAULT_CONFIG }, active: false };
   }
 
