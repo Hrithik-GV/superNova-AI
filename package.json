@@ -37,7 +37,8 @@
     "onCommand:mentor.resumeLastSession",
     "onCommand:mentor.showHistory",
     "onCommand:mentor.startQuiz",
-    "onCommand:mentor.reviewStructure"
+    "onCommand:mentor.reviewStructure",
+    "onCommand:mentor.resetAllData"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -99,6 +100,10 @@
       {
         "command": "mentor.reviewStructure",
         "title": "Mentor: Review Project Structure"
+      },
+      {
+        "command": "mentor.resetAllData",
+        "title": "Mentor: Reset All Data"
       }
     ],
     "menus": {

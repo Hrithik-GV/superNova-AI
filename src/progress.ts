@@ -49,6 +49,23 @@ export interface QuizResult {
 // Module-level reference to VS Code globalState, set on extension activation
 let _globalStateRef: vscode.Memento | undefined;
 
+// Optional logger hook to stream warnings & errors to the "Code Mentor" output channel
+let _logger: ((msg: string, err?: any) => void) | undefined;
+
+/**
+ * Sets an external logger callback (e.g. extension logError) for progress diagnostics.
+ */
+export function setProgressLogger(logger: (msg: string, err?: any) => void): void {
+  _logger = logger;
+}
+
+function logProgressError(msg: string, err?: any): void {
+  console.error(`Code Mentor: ${msg}`, err !== undefined ? err : '');
+  if (_logger) {
+    _logger(msg, err);
+  }
+}
+
 /**
  * Initializes the progress module with the extension globalState.
  * Allows getConcepts() and getQuizResults() to be invoked without arguments.
@@ -84,7 +101,9 @@ export function normalizeConcept(name: string): string {
 
 /**
  * Retrieves the stored concepts object from globalState.
- * Safe against missing storage or unexpected serialization issues.
+ * Wraps in try/catch and validates stored data.
+ * Migrates legacy data (e.g. numeric counts), skips and logs malformed records,
+ * and starts with an empty map if storage or records are corrupt.
  *
  * @param globalState - Optional globalState memento; defaults to the initialized reference
  * @returns ConceptsMap object
@@ -95,10 +114,71 @@ export function getConcepts(globalState?: vscode.Memento): ConceptsMap {
     if (!state) {
       return {};
     }
-    return state.get<ConceptsMap>(CONCEPTS_STORAGE_KEY, {}) || {};
+    const raw = state.get<any>(CONCEPTS_STORAGE_KEY, {});
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      logProgressError('Concepts storage is not an object; defaulting to empty concepts map');
+      return {};
+    }
+
+    const validConcepts: ConceptsMap = {};
+    for (const [key, val] of Object.entries(raw)) {
+      try {
+        const normalizedKey = normalizeConcept(key);
+        if (!normalizedKey) {
+          logProgressError(`Skipping concept with empty or invalid name: "${key}"`);
+          continue;
+        }
+
+        // Legacy format migration: concept value stored as a single numeric frequency count
+        if (typeof val === 'number' && !isNaN(val)) {
+          validConcepts[normalizedKey] = {
+            count: val,
+            lastSeen: new Date().toISOString(),
+            quizCorrect: 0,
+            quizTotal: 0
+          };
+          continue;
+        }
+
+        // Object format validation
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+          const count = (val as any).count;
+          const lastSeen = (val as any).lastSeen;
+
+          if (typeof count !== 'number' || isNaN(count)) {
+            logProgressError(`Skipping concept "${key}": missing or invalid numeric count`);
+            continue;
+          }
+          if (typeof lastSeen !== 'string' || !lastSeen) {
+            logProgressError(`Skipping concept "${key}": missing or invalid lastSeen timestamp`);
+            continue;
+          }
+
+          const quizCorrect = typeof (val as any).quizCorrect === 'number' && !isNaN((val as any).quizCorrect)
+            ? (val as any).quizCorrect
+            : 0;
+          const quizTotal = typeof (val as any).quizTotal === 'number' && !isNaN((val as any).quizTotal)
+            ? (val as any).quizTotal
+            : 0;
+
+          validConcepts[normalizedKey] = {
+            count,
+            lastSeen,
+            quizCorrect,
+            quizTotal
+          };
+        } else {
+          logProgressError(`Skipping concept "${key}": record has unexpected shape`);
+        }
+      } catch (itemErr) {
+        logProgressError(`Error validating concept "${key}":`, itemErr);
+      }
+    }
+
+    return validConcepts;
   } catch (err) {
     // Storage errors must never bubble up and crash consumers
-    console.error('Code Mentor: Failed to retrieve concepts from globalState:', err);
+    logProgressError('Failed to retrieve concepts from globalState:', err);
     return {};
   }
 }
@@ -122,7 +202,7 @@ export async function saveConcepts(
       return;
     }
 
-    const currentMap: ConceptsMap = { ...(state.get<ConceptsMap>(CONCEPTS_STORAGE_KEY, {}) || {}) };
+    const currentMap: ConceptsMap = { ...getConcepts(state) };
     const nowIso = new Date().toISOString();
     let hasUpdates = false;
 
@@ -146,16 +226,17 @@ export async function saveConcepts(
     }
   } catch (err) {
     // Storage errors must never disrupt the chat or show an error bubble to the learner
-    console.error('Code Mentor: Failed to save concepts to globalState:', err);
+    logProgressError('Failed to save concepts to globalState:', err);
   }
 }
 
 /**
  * Retrieves all stored quiz results from globalState.
- * Safe against missing storage or unexpected serialization issues.
+ * Validates each quiz result record, skips and logs corrupted items,
+ * and starts with an empty list if loading fails.
  *
  * @param globalState - Optional globalState memento; defaults to the initialized reference
- * @returns Array of QuizResult objects (at most 50)
+ * @returns Array of valid QuizResult objects (at most 50)
  */
 export function getQuizResults(globalState?: vscode.Memento): QuizResult[] {
   try {
@@ -163,13 +244,71 @@ export function getQuizResults(globalState?: vscode.Memento): QuizResult[] {
     if (!state) {
       return [];
     }
-    const results = state.get<QuizResult[]>(QUIZ_RESULTS_STORAGE_KEY, []) || [];
-    if (!Array.isArray(results)) {
+    const raw = state.get<any[]>(QUIZ_RESULTS_STORAGE_KEY, []);
+    if (!Array.isArray(raw)) {
+      logProgressError('Quiz results storage is not an array; defaulting to empty list');
       return [];
     }
-    return results;
+
+    const validResults: QuizResult[] = [];
+    for (let i = 0; i < raw.length; i++) {
+      const item = raw[i];
+      try {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+          logProgressError(`Skipping invalid quiz result at index ${i}: not an object`);
+          continue;
+        }
+        if (typeof item.ts !== 'string' || !item.ts) {
+          logProgressError(`Skipping invalid quiz result at index ${i}: missing or invalid "ts"`);
+          continue;
+        }
+        if (typeof item.sessionId !== 'string') {
+          logProgressError(`Skipping invalid quiz result at index ${i}: missing or invalid "sessionId"`);
+          continue;
+        }
+        if (typeof item.total !== 'number' || isNaN(item.total)) {
+          logProgressError(`Skipping invalid quiz result at index ${i}: missing or invalid "total"`);
+          continue;
+        }
+        if (typeof item.correct !== 'number' || isNaN(item.correct)) {
+          logProgressError(`Skipping invalid quiz result at index ${i}: missing or invalid "correct"`);
+          continue;
+        }
+        if (!item.byConcept || typeof item.byConcept !== 'object' || Array.isArray(item.byConcept)) {
+          logProgressError(`Skipping invalid quiz result at index ${i}: missing or invalid "byConcept"`);
+          continue;
+        }
+
+        const validByConcept: Record<string, QuizConceptScore> = {};
+        for (const [conceptKey, score] of Object.entries(item.byConcept)) {
+          const normalizedConcept = normalizeConcept(conceptKey);
+          if (normalizedConcept && score && typeof score === 'object') {
+            const c = (score as any).correct;
+            const t = (score as any).total;
+            if (typeof c === 'number' && !isNaN(c) && typeof t === 'number' && !isNaN(t)) {
+              validByConcept[normalizedConcept] = {
+                correct: c,
+                total: t
+              };
+            }
+          }
+        }
+
+        validResults.push({
+          ts: item.ts,
+          sessionId: item.sessionId,
+          total: (item.total === 3 ? 3 : item.total) as 3,
+          correct: item.correct,
+          byConcept: validByConcept
+        });
+      } catch (itemErr) {
+        logProgressError(`Error validating quiz result at index ${i}:`, itemErr);
+      }
+    }
+
+    return validResults;
   } catch (err) {
-    console.error('Code Mentor: Failed to retrieve quiz results from globalState:', err);
+    logProgressError('Failed to retrieve quiz results from globalState:', err);
     return [];
   }
 }
@@ -200,7 +339,7 @@ export async function recordQuizResult(
 
     // 2. Increment quizCorrect and quizTotal for each concept tested
     if (result.byConcept && typeof result.byConcept === 'object') {
-      const currentMap: ConceptsMap = { ...(state.get<ConceptsMap>(CONCEPTS_STORAGE_KEY, {}) || {}) };
+      const currentMap: ConceptsMap = { ...getConcepts(state) };
       let hasUpdates = false;
 
       for (const [rawConcept, score] of Object.entries(result.byConcept)) {
@@ -229,7 +368,7 @@ export async function recordQuizResult(
       }
     }
   } catch (err) {
-    console.error('Code Mentor: Failed to record quiz result in globalState:', err);
+    logProgressError('Failed to record quiz result in globalState:', err);
   }
 }
 
@@ -243,6 +382,20 @@ export async function clearConcepts(globalState?: vscode.Memento): Promise<void>
       await state.update(CONCEPTS_STORAGE_KEY, {});
     }
   } catch (err) {
-    console.error('Code Mentor: Failed to clear concepts from globalState:', err);
+    logProgressError('Failed to clear concepts from globalState:', err);
+  }
+}
+
+/**
+ * Resets all recorded quiz results in globalState.
+ */
+export async function clearQuizResults(globalState?: vscode.Memento): Promise<void> {
+  try {
+    const state = globalState || _globalStateRef;
+    if (state) {
+      await state.update(QUIZ_RESULTS_STORAGE_KEY, []);
+    }
+  } catch (err) {
+    logProgressError('Failed to clear quiz results from globalState:', err);
   }
 }

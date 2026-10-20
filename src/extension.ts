@@ -19,9 +19,11 @@ import {
   saveConcepts,
   getConcepts,
   clearConcepts,
+  clearQuizResults,
   recordQuizResult,
   getQuizResults,
-  QuizResult
+  QuizResult,
+  setProgressLogger
 } from './progress';
 import {
   MentorConfig,
@@ -48,7 +50,8 @@ import {
   clearAllSessions,
   getMostRecentSession,
   formatRelativeDate,
-  extractSessionConcepts
+  extractSessionConcepts,
+  setSessionLogger
 } from './sessions';
 
 /**
@@ -143,6 +146,10 @@ export async function activate(context: vscode.ExtensionContext) {
   // 1. Create OutputChannel named "Code Mentor" (Requirement E.1)
   logChannel = vscode.window.createOutputChannel('Code Mentor');
   context.subscriptions.push(logChannel);
+
+  // Hook up diagnostic loggers to "Code Mentor" output channel
+  setSessionLogger(logError);
+  setProgressLogger(logError);
 
   // 2. Initialize concept tracking module with extension globalState
   initProgress(context.globalState);
@@ -308,6 +315,37 @@ export async function activate(context: vscode.ExtensionContext) {
       await provider.reviewProjectStructure();
     })
   );
+
+  // Command: "Mentor: Reset All Data" (Requirement 6)
+  context.subscriptions.push(
+    vscode.commands.registerCommand('mentor.resetAllData', async () => {
+      const selection = await vscode.window.showQuickPick(
+        [
+          { label: 'Yes, reset all data', description: 'Permanently clears sessions, concepts, quiz results, and onboarding flags' },
+          { label: 'Cancel', description: 'Keep current data' }
+        ],
+        {
+          placeHolder: 'Are you sure you want to reset all Code Mentor data? This cannot be undone.'
+        }
+      );
+
+      if (!selection || selection.label !== 'Yes, reset all data') {
+        return;
+      }
+
+      try {
+        await clearAllSessions(context.globalState);
+        await clearConcepts(context.globalState);
+        await clearQuizResults(context.globalState);
+        await context.globalState.update('mentor.onboarded', false);
+        await provider.resetAllData();
+        vscode.window.showInformationMessage('Code Mentor: All sessions, concepts, quiz results, and onboarding data have been reset.');
+      } catch (err) {
+        logError('Failed to reset all data:', err);
+        vscode.window.showErrorMessage('Code Mentor: Failed to reset all data.');
+      }
+    })
+  );
 }
 
 export function deactivate() {
@@ -385,29 +423,54 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     try {
       this._activeSession = getActiveSession(this._globalState);
       if (this._activeSession) {
-        // Clamp restored hint level to config if active (Requirement 9)
-        const effectiveMax = this._currentConfig.maxHintLevel;
-        this._currentLevel = Math.min(this._activeSession.hintLevel || 1, effectiveMax) as 1 | 2 | 3 | 4;
-        this._currentTaskText = this._activeSession.originalTask || '';
+        if (!Array.isArray(this._activeSession.messages)) {
+          logError('Active session has invalid messages array; resetting active session to empty');
+          this._activeSession = null;
+        } else {
+          // Clamp restored hint level to config if active (Requirement 9)
+          const effectiveMax = this._currentConfig.maxHintLevel;
+          this._currentLevel = Math.min(this._activeSession.hintLevel || 1, effectiveMax) as 1 | 2 | 3 | 4;
+          this._currentTaskText = this._activeSession.originalTask || '';
 
-        // Rebuild in-memory LLM history from session.messages (Requirement 5)
-        this._history = this._activeSession.messages.map(m => ({
-          role: m.role,
-          content: m.text
-        }));
+          // Rebuild in-memory LLM history from session.messages (Requirement 5)
+          this._history = this._activeSession.messages.map(m => ({
+            role: m.role,
+            content: m.text
+          }));
 
-        // Restore mode
-        if (this._activeSession.messages.length > 0) {
-          const lastMode = this._activeSession.messages[this._activeSession.messages.length - 1].mode;
-          if (lastMode === 'explain' || lastMode === 'review' || lastMode === 'explain_back' || lastMode === 'paste_check') {
-            this._currentMode = lastMode;
-          } else {
-            this._currentMode = 'task';
+          // Restore mode
+          if (this._activeSession.messages.length > 0) {
+            const lastMode = this._activeSession.messages[this._activeSession.messages.length - 1].mode;
+            const validModes = ['explain', 'review', 'explain_back', 'paste_check', 'quiz', 'plan_review', 'architecture'];
+            if (validModes.includes(lastMode)) {
+              this._currentMode = lastMode as any;
+            } else {
+              this._currentMode = 'task';
+            }
           }
         }
       }
     } catch (err) {
-      console.error('Code Mentor: Failed to load active session during provider construction:', err);
+      logError('Failed to load active session during provider construction:', err);
+      this._activeSession = null;
+    }
+  }
+
+  /**
+   * Resets all in-memory mentor state and reloads the webview view (Requirement 6).
+   */
+  public async resetAllData(): Promise<void> {
+    this._activeSession = null;
+    this._history = [];
+    this._currentLevel = 1;
+    this._currentTaskText = '';
+    this._currentMode = 'task';
+    this._lastRequest = null;
+    this._structureConsentSessionId = null;
+    this._isOnboarded = false;
+
+    if (this._view) {
+      this._view.webview.html = this._getHtmlForWebview(this._view.webview);
     }
   }
 
@@ -457,69 +520,113 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     // =========================================================================
     webviewView.webview.onDidReceiveMessage(async (message) => {
       switch (message.type) {
+        case 'webviewError': {
+          // Requirement 2: Log webview error to "Code Mentor" output channel
+          const errMsg = message.message || 'Unknown webview error';
+          const src = message.source ? ` (${message.source}:${message.line || 0})` : (message.line ? ` (line ${message.line})` : '');
+          logError(`Webview error: ${errMsg}${src}`);
+          break;
+        }
+
         case 'ready': {
           this._isWebviewReady = true;
 
           // Deliver initial state to webview
-          this._postMessageToWebview({
-            type: 'config',
-            config: this._currentConfig,
-            active: this._activeConfig
-          });
-          this._postMessageToWebview({
-            type: 'apiKeyStatus',
-            hasApiKey: this._hasApiKey
-          });
-          this._postMessageToWebview({
-            type: 'onboardedStatus',
-            isOnboarded: this._isOnboarded
-          });
+          try {
+            this._postMessageToWebview({
+              type: 'config',
+              config: this._currentConfig,
+              active: this._activeConfig
+            });
+            this._postMessageToWebview({
+              type: 'apiKeyStatus',
+              hasApiKey: this._hasApiKey
+            });
+            this._postMessageToWebview({
+              type: 'onboardedStatus',
+              isOnboarded: this._isOnboarded
+            });
+          } catch (initErr) {
+            logError('Failed to deliver initial config/apiKeyStatus in ready handler:', initErr);
+          }
 
-          // Check command queues first (Requirements & Handshakes)
-          if (this._pendingReviewStructure) {
-            this._pendingReviewStructure = false;
-            await this.reviewProjectStructure();
-          } else if (this._pendingStartQuiz) {
-            const pending = this._pendingStartQuiz;
-            this._pendingStartQuiz = null;
-            await this.startQuiz(pending.forceIntermediate);
-          } else if (this._pendingResumeLastSession) {
-            this._pendingResumeLastSession = false;
-            await this.resumeLastSession();
-          } else if (this._pendingShowHistory) {
-            this._pendingShowHistory = false;
-            await this.showHistory();
-          } else if (this._pendingNotice) {
-            const notice = this._pendingNotice;
-            this._pendingNotice = null;
-            this._postMessageToWebview({
-              type: 'noticeMessage',
-              text: notice
-            });
-          } else if (this._pendingExplain) {
-            const pending = this._pendingExplain;
-            this._pendingExplain = null;
-            await this._executeExplain(pending.fileName, pending.languageId, pending.code);
-          } else if (this._pendingReview) {
-            const pending = this._pendingReview;
-            this._pendingReview = null;
-            await this._executeReview(pending.fileName, pending.languageId, pending.code);
-          } else if (this._pendingPasteExplain) {
-            const pending = this._pendingPasteExplain;
-            this._pendingPasteExplain = null;
-            await this._promptPasteCheckInWebview(pending);
-          } else if (this._activeSession && this._activeSession.messages.length > 0) {
-            // Restore active session to webview (Requirement 5)
-            const effectiveMax = this._currentConfig.maxHintLevel;
-            this._activeSession.hintLevel = Math.min(this._activeSession.hintLevel, effectiveMax) as 1 | 2 | 3 | 4;
-            this._currentLevel = this._activeSession.hintLevel;
-            this._postMessageToWebview({
-              type: 'restore',
-              session: this._activeSession
-            });
-          } else {
-            // Empty chat: check if past session exists for Welcome Continue Card (Requirement 7)
-            this._checkAndPostWelcomeContinueCard();
+          let statePosted = false;
+
+          try {
+            // Check command queues first (Requirements & Handshakes)
+            if (this._pendingReviewStructure) {
+              this._pendingReviewStructure = false;
+              statePosted = true;
+              await this.reviewProjectStructure();
+            } else if (this._pendingStartQuiz) {
+              const pending = this._pendingStartQuiz;
+              this._pendingStartQuiz = null;
+              statePosted = true;
+              await this.startQuiz(pending.forceIntermediate);
+            } else if (this._pendingResumeLastSession) {
+              this._pendingResumeLastSession = false;
+              statePosted = true;
+              await this.resumeLastSession();
+            } else if (this._pendingShowHistory) {
+              this._pendingShowHistory = false;
+              statePosted = true;
+              await this.showHistory();
+            } else if (this._pendingNotice) {
+              const notice = this._pendingNotice;
+              this._pendingNotice = null;
+              statePosted = true;
+              this._postMessageToWebview({
+                type: 'noticeMessage',
+                text: notice
+              });
+            } else if (this._pendingExplain) {
+              const pending = this._pendingExplain;
+              this._pendingExplain = null;
+              statePosted = true;
+              await this._executeExplain(pending.fileName, pending.languageId, pending.code);
+            } else if (this._pendingReview) {
+              const pending = this._pendingReview;
+              this._pendingReview = null;
+              statePosted = true;
+              await this._executeReview(pending.fileName, pending.languageId, pending.code);
+            } else if (this._pendingPasteExplain) {
+              const pending = this._pendingPasteExplain;
+              this._pendingPasteExplain = null;
+              statePosted = true;
+              await this._promptPasteCheckInWebview(pending);
+            } else if (this._activeSession && Array.isArray(this._activeSession.messages) && this._activeSession.messages.length > 0) {
+              // Restore active session to webview (Requirements 3, 4 & 5)
+              try {
+                const effectiveMax = this._currentConfig.maxHintLevel;
+                this._activeSession.hintLevel = Math.min(this._activeSession.hintLevel || 1, effectiveMax) as 1 | 2 | 3 | 4;
+                this._currentLevel = this._activeSession.hintLevel;
+                this._postMessageToWebview({
+                  type: 'restore',
+                  session: this._activeSession
+                });
+                statePosted = true;
+              } catch (restoreErr) {
+                logError('Failed to post restore session in ready handler:', restoreErr);
+                this._activeSession = null;
+                this._history = [];
+                this._currentLevel = 1;
+                this._currentTaskText = '';
+                this._currentMode = 'task';
+                statePosted = false;
+              }
+            }
+          } catch (readyActionErr) {
+            logError('Error executing pending actions in ready handler:', readyActionErr);
+          }
+
+          // Requirements 3 & 5: Ensure ready handler always posts a state message even when restore fails
+          if (!statePosted) {
+            try {
+              this._postMessageToWebview({ type: 'taskReset' });
+              this._checkAndPostWelcomeContinueCard();
+            } catch (fallbackErr) {
+              logError('Failed to post fallback taskReset in ready handler:', fallbackErr);
+            }
           }
           break;
         }
@@ -2321,16 +2428,20 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   public async resumeSessionById(sessionId: string): Promise<void> {
     try {
       // 1. Save current session if active and contains messages
-      if (this._activeSession && this._activeSession.messages.length > 0) {
-        await saveSession(this._globalState, this._activeSession);
+      if (this._activeSession && Array.isArray(this._activeSession.messages) && this._activeSession.messages.length > 0) {
+        try {
+          await saveSession(this._globalState, this._activeSession);
+        } catch (saveErr) {
+          logError('Failed to save current session before resuming:', saveErr);
+        }
       }
 
       // 2. Fetch targeted session
       const session = getSessionById(this._globalState, sessionId);
-      if (!session) {
+      if (!session || !Array.isArray(session.messages)) {
         this._postMessageToWebview({
           type: 'noticeMessage',
-          text: 'Selected session could not be found.'
+          text: 'Selected session could not be found or failed validation.'
         });
         return;
       }
@@ -2369,7 +2480,8 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         session: this._activeSession
       });
     } catch (err) {
-      console.error('Code Mentor: Failed to resume session by ID:', err);
+      logError('Failed to resume session by ID:', err);
+      this._postMessageToWebview({ type: 'taskReset' });
     }
   }
 
@@ -3320,6 +3432,35 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
     .btn-action:disabled {
       opacity: 0.5;
       cursor: not-allowed;
+    }
+
+    .btn-action.danger {
+      background: var(--vscode-statusBarItem-errorBackground, #c72e2e);
+      color: var(--vscode-statusBarItem-errorForeground, #ffffff);
+    }
+
+    .btn-action.danger:hover:not(:disabled) {
+      background: #e03e3e;
+    }
+
+    .btn-action.btn-action-secondary {
+      background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.2));
+      color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+    }
+
+    .btn-action.btn-action-secondary:hover:not(:disabled) {
+      background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.3));
+    }
+
+    .webview-inchat-error-card {
+      margin: 8px 0;
+    }
+
+    .webview-error-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
     }
 
     /* Loading & Cancel Section (Requirement B) */
@@ -4677,6 +4818,158 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
   <script>
     const vscode = acquireVsCodeApi();
 
+    // -------------------------------------------------------------------------
+    // WEBVIEW ERROR MONITORING & RESILIENCE (Requirement 1)
+    // -------------------------------------------------------------------------
+    function sanitizeErrorString(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]')
+        .replace(/AQ\.[0-9A-Za-z-_]{20,}/g, '[REDACTED_API_KEY]')
+        .replace(/sk-[0-9A-Za-z-_]{20,}/g, '[REDACTED_API_KEY]')
+        .replace(/key=[^&\s]+/gi, 'key=[REDACTED]');
+    }
+
+    let isHandlingWebviewError = false;
+    function handleWebviewError(rawMessage, rawSource, rawLine) {
+      if (isHandlingWebviewError) return;
+      isHandlingWebviewError = true;
+      try {
+        const cleanMsg = sanitizeErrorString(rawMessage || 'Unknown webview error').slice(0, 300);
+        const cleanSrc = sanitizeErrorString(rawSource || '').slice(0, 200);
+        const cleanLine = typeof rawLine === 'number' ? rawLine : parseInt(rawLine, 10) || 0;
+
+        // Post sanitized error report (never includes chat content or API keys)
+        vscode.postMessage({
+          type: 'webviewError',
+          message: cleanMsg,
+          source: cleanSrc,
+          line: cleanLine
+        });
+
+        renderWebviewErrorCard();
+      } catch (e) {
+        console.error('Failed to report webview error:', e);
+      } finally {
+        isHandlingWebviewError = false;
+      }
+    }
+
+    window.onerror = function(message, source, lineno, colno, error) {
+      let msg = message;
+      if (error && error.message) {
+        msg = error.message;
+      }
+      handleWebviewError(msg, source, lineno);
+      return false;
+    };
+
+    window.onunhandledrejection = function(event) {
+      let msg = 'Unhandled promise rejection';
+      let src = '';
+      let line = 0;
+      if (event && event.reason) {
+        if (event.reason instanceof Error) {
+          msg = event.reason.message || String(event.reason);
+          src = event.reason.fileName || '';
+          line = event.reason.lineNumber || 0;
+        } else {
+          msg = String(event.reason);
+        }
+      }
+      handleWebviewError(msg, src, line);
+    };
+
+    function renderWebviewErrorCard() {
+      const container = document.getElementById('messages-container');
+      if (!container) return;
+
+      const existing = container.querySelector('.webview-inchat-error-card');
+      if (existing) {
+        return;
+      }
+
+      const welcome = document.getElementById('welcome-card');
+      if (welcome) {
+        welcome.style.display = 'none';
+      }
+
+      const row = document.createElement('div');
+      row.className = 'message-row';
+
+      const card = document.createElement('div');
+      card.className = 'error-card webview-inchat-error-card';
+
+      const textEl = document.createElement('div');
+      textEl.className = 'error-card-text';
+      textEl.textContent = 'Something went wrong in the chat view.';
+      card.appendChild(textEl);
+
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'webview-error-actions';
+
+      // 1. "Reload chat" button (re-requests state via 'ready')
+      const reloadBtn = document.createElement('button');
+      reloadBtn.type = 'button';
+      reloadBtn.className = 'btn-action';
+      reloadBtn.textContent = 'Reload chat';
+      reloadBtn.addEventListener('click', function() {
+        row.remove();
+        vscode.postMessage({ type: 'ready' });
+      });
+      actionsDiv.appendChild(reloadBtn);
+
+      // 2. "Reset chat history" button (inline confirmation)
+      const resetBtn = document.createElement('button');
+      resetBtn.type = 'button';
+      resetBtn.className = 'btn-action btn-action-secondary';
+      resetBtn.textContent = 'Reset chat history';
+
+      const inlineConfirm = document.createElement('span');
+      inlineConfirm.className = 'delete-confirm-inline';
+      inlineConfirm.style.display = 'none';
+
+      const confirmText = document.createElement('span');
+      confirmText.textContent = 'Reset chat history? ';
+      inlineConfirm.appendChild(confirmText);
+
+      const confirmYesBtn = document.createElement('button');
+      confirmYesBtn.type = 'button';
+      confirmYesBtn.className = 'btn-action danger';
+      confirmYesBtn.textContent = 'Yes, reset';
+      confirmYesBtn.addEventListener('click', function() {
+        row.remove();
+        vscode.postMessage({ type: 'clearAllSessions' });
+      });
+      inlineConfirm.appendChild(confirmYesBtn);
+
+      const confirmCancelBtn = document.createElement('button');
+      confirmCancelBtn.type = 'button';
+      confirmCancelBtn.className = 'btn-action';
+      confirmCancelBtn.textContent = 'Cancel';
+      confirmCancelBtn.addEventListener('click', function() {
+        inlineConfirm.style.display = 'none';
+        resetBtn.style.display = 'inline-block';
+      });
+      inlineConfirm.appendChild(confirmCancelBtn);
+
+      resetBtn.addEventListener('click', function() {
+        resetBtn.style.display = 'none';
+        inlineConfirm.style.display = 'inline-flex';
+      });
+
+      actionsDiv.appendChild(resetBtn);
+      actionsDiv.appendChild(inlineConfirm);
+
+      card.appendChild(actionsDiv);
+      row.appendChild(card);
+      container.appendChild(row);
+
+      try {
+        container.scrollTop = container.scrollHeight;
+      } catch (e) {}
+    }
+
     const messagesContainer = document.getElementById('messages-container');
     const welcomeCard = document.getElementById('welcome-card');
     const welcomeNormalContent = document.getElementById('welcome-normal-content');
@@ -5761,60 +6054,90 @@ class MentorChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         case 'restore': {
-          // Requirement 5: Rebuild chat using live renderers
-          const session = message.session;
-          if (!session) break;
+          try {
+            // Requirement 5: Rebuild chat using live renderers
+            const session = message.session;
+            if (!session) {
+              showView('chat');
+              break;
+            }
 
-          // Switch to chat view (Requirement 2)
-          showView('chat');
+            // Switch to chat view (Requirement 2)
+            showView('chat');
 
-          // Clear existing messages from UI
-          const rows = messagesContainer.querySelectorAll('.message-row, .cancelled-note, .notice-card');
-          rows.forEach(function(r) { r.remove(); });
+            // Clear existing messages from UI
+            const rows = messagesContainer.querySelectorAll('.message-row, .cancelled-note, .notice-card');
+            rows.forEach(function(r) { r.remove(); });
 
-          if (welcomeCard) {
-            welcomeCard.style.display = 'none';
-          }
+            if (welcomeCard) {
+              welcomeCard.style.display = 'none';
+            }
 
-          // Restore hint level buttons
-          selectHintLevel(session.hintLevel || 1);
+            // Restore hint level buttons
+            selectHintLevel(session.hintLevel || 1);
 
-          // Rebuild chat with the SAME card renderers used for live replies
-          if (Array.isArray(session.messages)) {
-            session.messages.forEach(function(msg) {
-              if (msg.role === 'user') {
-                appendUserMessage(msg.text);
-              } else if (msg.role === 'assistant') {
-                if (msg.mode === 'quiz') {
-                  renderStoredQuizCard(msg.text);
-                } else {
-                  let parsed;
-                  try {
-                    parsed = JSON.parse(msg.text);
-                  } catch (e) {
-                    // Fallback if stored reply fails to parse
-                    parsed = {
-                      message: msg.text || '',
-                      concept: [],
-                      next_step: '',
-                      question: null,
-                      hint_level: session.hintLevel || 1
-                    };
+            // Requirement 4: Rebuild chat with card renderers; unknown modes must render with plain reply card
+            const knownModes = ['chat', 'task', 'explain', 'review', 'explain_back', 'paste_check', 'quiz', 'plan_review', 'architecture'];
+
+            if (Array.isArray(session.messages)) {
+              session.messages.forEach(function(msg) {
+                try {
+                  if (!msg || typeof msg !== 'object') {
+                    return;
                   }
-                  const renderMode = msg.mode === 'chat' ? 'task' : msg.mode;
-                  renderMentorReplyCard(parsed, renderMode);
+                  if (msg.role === 'user') {
+                    appendUserMessage(msg.text || '');
+                  } else if (msg.role === 'assistant') {
+                    const effectiveMode = (typeof msg.mode === 'string' && knownModes.indexOf(msg.mode) !== -1)
+                      ? msg.mode
+                      : 'task';
+
+                    if (effectiveMode === 'quiz') {
+                      renderStoredQuizCard(msg.text);
+                    } else {
+                      let parsed;
+                      try {
+                        parsed = JSON.parse(msg.text);
+                      } catch (e) {
+                        // Fallback if stored reply fails to parse
+                        parsed = {
+                          message: msg.text || '',
+                          concept: [],
+                          next_step: '',
+                          question: null,
+                          hint_level: session.hintLevel || 1
+                        };
+                      }
+                      if (!parsed || typeof parsed !== 'object') {
+                        parsed = {
+                          message: String(msg.text || ''),
+                          concept: [],
+                          next_step: '',
+                          question: null,
+                          hint_level: session.hintLevel || 1
+                        };
+                      }
+                      const renderMode = effectiveMode === 'chat' ? 'task' : effectiveMode;
+                      renderMentorReplyCard(parsed, renderMode);
+                    }
+                  }
+                } catch (msgErr) {
+                  console.error('Error rendering restored message item:', msgErr);
                 }
-              }
-            });
-          }
+              });
+            }
 
-          hasReplies = Array.isArray(session.messages) && session.messages.some(function(m) { return m.role === 'assistant'; });
-          if (hasReplies && explainBackSection) {
-            explainBackSection.style.display = 'block';
-          }
+            hasReplies = Array.isArray(session.messages) && session.messages.some(function(m) { return m && m.role === 'assistant'; });
+            if (hasReplies && explainBackSection) {
+              explainBackSection.style.display = 'block';
+            }
 
-          // Scroll to newest message after restoring (Requirement 2 & 5)
-          scrollToBottom(true);
+            // Scroll to newest message after restoring (Requirement 2 & 5)
+            scrollToBottom(true);
+          } catch (restoreErr) {
+            console.error('Error restoring session in webview:', restoreErr);
+            handleWebviewError(restoreErr && restoreErr.message ? restoreErr.message : 'Error restoring session');
+          }
           break;
         }
 

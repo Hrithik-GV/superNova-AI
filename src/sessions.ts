@@ -41,6 +41,98 @@ export interface Session {
   messages: StoredMessage[];
 }
 
+// Optional logger hook to stream warnings & errors to the "Code Mentor" output channel
+let _logger: ((msg: string, err?: any) => void) | undefined;
+
+/**
+ * Sets an external logger callback (e.g. extension logError) for session diagnostics.
+ */
+export function setSessionLogger(logger: (msg: string, err?: any) => void): void {
+  _logger = logger;
+}
+
+function logSessionError(msg: string, err?: any): void {
+  console.error(`Code Mentor: ${msg}`, err !== undefined ? err : '');
+  if (_logger) {
+    _logger(msg, err);
+  }
+}
+
+/**
+ * Validates a single stored message.
+ * Must be an object with string fields: role, text, mode, ts.
+ */
+export function validateStoredMessage(raw: any): StoredMessage | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  if (typeof raw.role !== 'string' || !raw.role) {
+    return null;
+  }
+  if (typeof raw.text !== 'string') {
+    return null;
+  }
+  if (typeof raw.mode !== 'string') {
+    return null;
+  }
+  if (typeof raw.ts !== 'string') {
+    return null;
+  }
+  return {
+    role: raw.role as 'user' | 'assistant',
+    text: raw.text,
+    mode: raw.mode,
+    ts: raw.ts
+  };
+}
+
+/**
+ * Validates a stored session.
+ * id and messages must exist, and messages must be an array of {role, text, mode, ts}.
+ * Malformed messages inside the session are skipped and logged.
+ * If the session object itself is invalid, returns null and logs the issue.
+ */
+export function validateSession(raw: any): Session | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    logSessionError('Session validation failed: item is not an object');
+    return null;
+  }
+  if (typeof raw.id !== 'string' || !raw.id.trim()) {
+    logSessionError('Session validation failed: missing or invalid "id" field');
+    return null;
+  }
+  if (!Array.isArray(raw.messages)) {
+    logSessionError(`Session validation failed for session ${raw.id}: "messages" is not an array`);
+    return null;
+  }
+
+  const validMessages: StoredMessage[] = [];
+  for (let i = 0; i < raw.messages.length; i++) {
+    const msg = raw.messages[i];
+    const validated = validateStoredMessage(msg);
+    if (validated) {
+      validMessages.push(validated);
+    } else {
+      logSessionError(`Skipping invalid message at index ${i} in session ${raw.id}: missing or malformed fields`);
+    }
+  }
+
+  const hintLevel: 1 | 2 | 3 | 4 = (raw.hintLevel === 1 || raw.hintLevel === 2 || raw.hintLevel === 3 || raw.hintLevel === 4)
+    ? raw.hintLevel
+    : 1;
+
+  return {
+    id: raw.id.trim(),
+    title: typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : 'Untitled session',
+    createdAt: typeof raw.createdAt === 'string' && raw.createdAt ? raw.createdAt : new Date().toISOString(),
+    updatedAt: typeof raw.updatedAt === 'string' && raw.updatedAt ? raw.updatedAt : new Date().toISOString(),
+    workspaceName: typeof raw.workspaceName === 'string' ? raw.workspaceName : '',
+    hintLevel,
+    originalTask: typeof raw.originalTask === 'string' ? raw.originalTask : '',
+    messages: validMessages
+  };
+}
+
 /**
  * Generates a unique session ID based on timestamp and randomness.
  */
@@ -124,21 +216,38 @@ export function extractSessionConcepts(session: Session, limit: number = 3): str
 
 /**
  * Retrieves all stored sessions from globalState, sorted newest first by updatedAt.
- * Wrapped in try/catch to protect callers from storage issues.
+ * Validates each session: id and messages must exist, messages must be valid.
+ * Skips and logs any invalid session or message. If everything fails, returns [].
  */
 export function getAllSessions(globalState: vscode.Memento): Session[] {
   try {
-    const raw = globalState.get<Session[]>(SESSIONS_STORAGE_KEY, []);
+    const raw = globalState.get<any[]>(SESSIONS_STORAGE_KEY, []);
     if (!Array.isArray(raw)) {
+      logSessionError('Sessions storage is not an array; defaulting to empty list');
       return [];
     }
-    return raw.sort((a, b) => {
+
+    const validSessions: Session[] = [];
+    for (let i = 0; i < raw.length; i++) {
+      try {
+        const validated = validateSession(raw[i]);
+        if (validated) {
+          validSessions.push(validated);
+        } else {
+          logSessionError(`Skipping invalid session at index ${i}`);
+        }
+      } catch (itemErr) {
+        logSessionError(`Error validating session at index ${i}:`, itemErr);
+      }
+    }
+
+    return validSessions.sort((a, b) => {
       const ta = new Date(b.updatedAt || b.createdAt || 0).getTime();
       const tb = new Date(a.updatedAt || a.createdAt || 0).getTime();
       return ta - tb;
     });
   } catch (err) {
-    console.error('Code Mentor: Failed to load sessions from globalState:', err);
+    logSessionError('Failed to load sessions from globalState:', err);
     return [];
   }
 }
@@ -149,7 +258,8 @@ export function getAllSessions(globalState: vscode.Memento): Session[] {
 export function getActiveSessionId(globalState: vscode.Memento): string | null {
   try {
     return globalState.get<string | null>(ACTIVE_SESSION_STORAGE_KEY, null);
-  } catch {
+  } catch (err) {
+    logSessionError('Failed to retrieve active session ID:', err);
     return null;
   }
 }
@@ -161,29 +271,40 @@ export async function setActiveSessionId(globalState: vscode.Memento, sessionId:
   try {
     await globalState.update(ACTIVE_SESSION_STORAGE_KEY, sessionId);
   } catch (err) {
-    console.error('Code Mentor: Failed to update active session ID in globalState:', err);
+    logSessionError('Failed to update active session ID in globalState:', err);
   }
 }
 
 /**
  * Retrieves a single session by ID from globalState.
+ * Returns null if not found or if validation fails.
  */
 export function getSessionById(globalState: vscode.Memento, sessionId: string): Session | null {
   try {
+    if (!sessionId || typeof sessionId !== 'string') {
+      return null;
+    }
     const sessions = getAllSessions(globalState);
     return sessions.find(s => s.id === sessionId) || null;
-  } catch {
+  } catch (err) {
+    logSessionError(`Failed to find session by ID "${sessionId}":`, err);
     return null;
   }
 }
 
 /**
  * Retrieves the currently active session from globalState.
+ * Validates the session structure and returns null if corrupt or missing.
  */
 export function getActiveSession(globalState: vscode.Memento): Session | null {
-  const activeId = getActiveSessionId(globalState);
-  if (!activeId) return null;
-  return getSessionById(globalState, activeId);
+  try {
+    const activeId = getActiveSessionId(globalState);
+    if (!activeId) return null;
+    return getSessionById(globalState, activeId);
+  } catch (err) {
+    logSessionError('Failed to load active session:', err);
+    return null;
+  }
 }
 
 /**
@@ -229,22 +350,28 @@ export async function saveSession(globalState: vscode.Memento, session: Session)
       return;
     }
 
-    // Enforce message limits: max 200 messages, keeping the first message for title
-    if (session.messages.length > MAX_MESSAGES_PER_SESSION) {
-      const firstMessage = session.messages[0];
-      const recentMessages = session.messages.slice(session.messages.length - (MAX_MESSAGES_PER_SESSION - 1));
-      session.messages = [firstMessage, ...recentMessages];
+    const validated = validateSession(session);
+    if (!validated) {
+      logSessionError(`Cannot save invalid session "${session?.id}"`);
+      return;
     }
 
-    session.updatedAt = new Date().toISOString();
+    // Enforce message limits: max 200 messages, keeping the first message for title
+    if (validated.messages.length > MAX_MESSAGES_PER_SESSION) {
+      const firstMessage = validated.messages[0];
+      const recentMessages = validated.messages.slice(validated.messages.length - (MAX_MESSAGES_PER_SESSION - 1));
+      validated.messages = [firstMessage, ...recentMessages];
+    }
+
+    validated.updatedAt = new Date().toISOString();
 
     const existingSessions = getAllSessions(globalState);
-    const index = existingSessions.findIndex(s => s.id === session.id);
+    const index = existingSessions.findIndex(s => s.id === validated.id);
 
     if (index >= 0) {
-      existingSessions[index] = session;
+      existingSessions[index] = validated;
     } else {
-      existingSessions.unshift(session);
+      existingSessions.unshift(validated);
     }
 
     // Sort newest first by updatedAt
@@ -259,7 +386,7 @@ export async function saveSession(globalState: vscode.Memento, session: Session)
 
     await globalState.update(SESSIONS_STORAGE_KEY, prunedSessions);
   } catch (err) {
-    console.error('Code Mentor: Failed to save session to globalState:', err);
+    logSessionError('Failed to save session to globalState:', err);
   }
 }
 
@@ -278,7 +405,7 @@ export async function deleteSession(globalState: vscode.Memento, sessionId: stri
       await setActiveSessionId(globalState, null);
     }
   } catch (err) {
-    console.error('Code Mentor: Failed to delete session from globalState:', err);
+    logSessionError('Failed to delete session from globalState:', err);
   }
 }
 
@@ -290,7 +417,7 @@ export async function clearAllSessions(globalState: vscode.Memento): Promise<voi
     await globalState.update(SESSIONS_STORAGE_KEY, []);
     await setActiveSessionId(globalState, null);
   } catch (err) {
-    console.error('Code Mentor: Failed to clear all sessions from globalState:', err);
+    logSessionError('Failed to clear all sessions from globalState:', err);
   }
 }
 
@@ -300,8 +427,9 @@ export async function clearAllSessions(globalState: vscode.Memento): Promise<voi
 export function getMostRecentSession(globalState: vscode.Memento): Session | null {
   try {
     const sessions = getAllSessions(globalState);
-    return sessions.find(s => s.messages && s.messages.length > 0) || null;
-  } catch {
+    return sessions.find(s => Array.isArray(s.messages) && s.messages.length > 0) || null;
+  } catch (err) {
+    logSessionError('Failed to get most recent session:', err);
     return null;
   }
 }
