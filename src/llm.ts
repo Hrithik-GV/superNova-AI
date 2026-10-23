@@ -41,15 +41,40 @@ export interface QuizQuestion {
 }
 
 /**
+ * Step milestone tracking information.
+ */
+export interface StepInfo {
+  current: number;
+  total: number;
+  title: string;
+}
+
+/**
+ * Contextual action chip for one-click learner progression.
+ */
+export interface ActionChip {
+  label: string;
+  action: 'next_step' | 'show_snippet' | 'explain' | 'check_code' | 'ask';
+  payload?: string;
+}
+
+/**
  * Structured response schema expected from Code Mentor.
  */
 export interface MentorReply {
-  message: string;            // short, friendly explanation, max ~120 words
-  concept: string[];          // 1-2 concept names, e.g. ["Flexbox", "Semantic HTML"]
-  next_step: string;          // ONE small action the learner should try next
+  message: string;            // friendly, structured explanation
+  bullets?: string[];         // actionable bullet points
+  steps?: string[];           // project milestone roadmap
+  step_info?: StepInfo;       // current step indicator e.g. { current: 1, total: 4, title: 'Setup' }
+  pro_tip?: string;           // developer shortcut or helpful tip
+  concept: string[];          // 1-2 concept names
+  next_step: string;          // action learner should try next
   question: string | null;    // optional guiding or clarifying question
-  hint_level: 1 | 2 | 3 | 4;  // 1=nudge 2=hint 3=structure 4=solution
-  code_snippet: string | null; // max 5 lines unless hint_level is 4
+  hint_level?: 1 | 2 | 3 | 4; // backward compatible hint level
+  code_snippet: string | null; // scaffolded code snippet for the current step
+  code_language?: string;     // e.g. 'html', 'css', 'javascript'
+  code_target_file?: string;  // e.g. 'index.html', 'style.css', 'script.js'
+  action_chips?: ActionChip[]; // quick action chips
   line_notes?: LineNote[];    // optional line-by-line notes for explain mode
   findings?: ReviewFinding[]; // optional findings for review mode
   understanding?: 'solid' | 'partial' | 'shaky'; // optional rating for explain_back/paste_check modes
@@ -65,6 +90,7 @@ export class MissingApiKeyError extends Error {
   constructor(message = 'Google Gemini API key is missing. Please set your API key in settings.') {
     super(message);
     this.name = 'MissingApiKeyError';
+    Object.setPrototypeOf(this, MissingApiKeyError.prototype);
   }
 }
 
@@ -87,11 +113,18 @@ export function parseMentorReply(raw: string): MentorReply {
   // Safe default fallback object matching the MentorReply interface
   const fallback: MentorReply = {
     message: raw || '',
+    bullets: undefined,
+    steps: undefined,
+    step_info: undefined,
+    pro_tip: undefined,
     concept: [],
     next_step: '',
     question: null,
     hint_level: 1,
     code_snippet: null,
+    code_language: undefined,
+    code_target_file: undefined,
+    action_chips: undefined,
     line_notes: undefined,
     findings: undefined,
     understanding: undefined,
@@ -142,6 +175,65 @@ export function parseMentorReply(raw: string): MentorReply {
     const message = typeof parsed.message === 'string'
       ? parsed.message
       : (parsed.message != null ? String(parsed.message) : '');
+
+    // 3a-1. Bullets (string array)
+    let bullets: string[] | undefined = undefined;
+    if (Array.isArray(parsed.bullets)) {
+      const bList = parsed.bullets
+        .filter((b: any) => typeof b === 'string' && b.trim().length > 0)
+        .map((b: string) => b.trim());
+      if (bList.length > 0) bullets = bList;
+    }
+
+    // 3a-2. Steps roadmap (string array)
+    let steps: string[] | undefined = undefined;
+    if (Array.isArray(parsed.steps)) {
+      const sList = parsed.steps
+        .filter((s: any) => typeof s === 'string' && s.trim().length > 0)
+        .map((s: string) => s.trim());
+      if (sList.length > 0) steps = sList;
+    }
+
+    // 3a-3. Step info ({ current, total, title })
+    let step_info: StepInfo | undefined = undefined;
+    if (parsed.step_info && typeof parsed.step_info === 'object') {
+      const curr = Number(parsed.step_info.current) || 1;
+      const tot = Number(parsed.step_info.total) || 1;
+      const title = typeof parsed.step_info.title === 'string' ? parsed.step_info.title.trim() : '';
+      step_info = { current: curr, total: tot, title: title || ('Step ' + curr) };
+    }
+
+    // 3a-4. Pro tip (string)
+    const pro_tip = typeof parsed.pro_tip === 'string' && parsed.pro_tip.trim().length > 0
+      ? parsed.pro_tip.trim()
+      : undefined;
+
+    // 3a-5. Code language and target file
+    const code_language = typeof parsed.code_language === 'string' && parsed.code_language.trim().length > 0
+      ? parsed.code_language.trim()
+      : undefined;
+    const code_target_file = typeof parsed.code_target_file === 'string' && parsed.code_target_file.trim().length > 0
+      ? parsed.code_target_file.trim()
+      : undefined;
+
+    // 3a-6. Action chips (array of { label, action, payload })
+    let action_chips: ActionChip[] | undefined = undefined;
+    if (Array.isArray(parsed.action_chips)) {
+      const chips: ActionChip[] = [];
+      for (const item of parsed.action_chips) {
+        if (item && typeof item === 'object') {
+          const label = typeof item.label === 'string' ? item.label.trim() : '';
+          const act = (item.action === 'next_step' || item.action === 'show_snippet' || item.action === 'explain' || item.action === 'check_code' || item.action === 'ask')
+            ? item.action
+            : 'ask';
+          const payload = typeof item.payload === 'string' ? item.payload.trim() : undefined;
+          if (label) {
+            chips.push({ label, action: act, payload });
+          }
+        }
+      }
+      if (chips.length > 0) action_chips = chips;
+    }
 
     // 3b. Concept (string array)
     let concept: string[] = [];
@@ -295,11 +387,18 @@ export function parseMentorReply(raw: string): MentorReply {
 
     return {
       message,
+      bullets,
+      steps,
+      step_info,
+      pro_tip,
       concept,
       next_step,
       question,
       hint_level,
       code_snippet,
+      code_language,
+      code_target_file,
+      action_chips,
       line_notes,
       findings,
       understanding,

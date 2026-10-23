@@ -1,7 +1,7 @@
 {
   "name": "polaris",
-  "displayName": "Polaris",
-  "description": "A guiding-star coding mentor that teaches you to build web interfaces by guiding, questioning and checking your understanding, instead of writing the code for you.",
+  "displayName": "Supernova AI",
+  "description": "A guiding-star coding mentor with an animated AI cat companion that teaches you to build web interfaces by guiding, questioning, and checking your understanding.",
   "version": "0.1.0",
   "publisher": "code-mentor-team",
   "license": "MIT",
@@ -18,7 +18,10 @@
     "Other"
   ],
   "keywords": [
+    "supernova",
     "polaris",
+    "cat",
+    "mascot",
     "learning",
     "mentor",
     "education",
@@ -47,7 +50,7 @@
       "activitybar": [
         {
           "id": "mentor",
-          "title": "Polaris",
+          "title": "Supernova AI",
           "icon": "resources/mentor-icon.svg"
         }
       ]
@@ -57,54 +60,54 @@
         {
           "type": "webview",
           "id": "mentor.chat",
-          "name": "Polaris"
+          "name": "Supernova AI"
         }
       ]
     },
     "commands": [
       {
         "command": "mentor.openChat",
-        "title": "Polaris: Open Chat"
+        "title": "Supernova AI: Open Chat"
       },
       {
         "command": "mentor.explainSelection",
-        "title": "Polaris: Explain Selection"
+        "title": "Supernova AI: Explain Selection"
       },
       {
         "command": "mentor.reviewFile",
-        "title": "Polaris: Review My Code"
+        "title": "Supernova AI: Review My Code"
       },
       {
         "command": "mentor.createConfig",
-        "title": "Polaris: Create Course Config (.mentor.json)"
+        "title": "Supernova AI: Create Course Config (.mentor.json)"
       },
       {
         "command": "mentor.testConnection",
-        "title": "Polaris: Test API Connection"
+        "title": "Supernova AI: Test API Connection"
       },
       {
         "command": "mentor.showLogs",
-        "title": "Polaris: Show Logs"
+        "title": "Supernova AI: Show Logs"
       },
       {
         "command": "mentor.resumeLastSession",
-        "title": "Polaris: Resume Last Session"
+        "title": "Supernova AI: Resume Last Session"
       },
       {
         "command": "mentor.showHistory",
-        "title": "Polaris: Show Chat History"
+        "title": "Supernova AI: Show Chat History"
       },
       {
         "command": "mentor.startQuiz",
-        "title": "Polaris: Quiz Me"
+        "title": "Supernova AI: Quiz Me"
       },
       {
         "command": "mentor.reviewStructure",
-        "title": "Polaris: Review Project Structure"
+        "title": "Supernova AI: Review Project Structure"
       },
       {
         "command": "mentor.resetAllData",
-        "title": "Polaris: Reset All Data"
+        "title": "Supernova AI: Reset All Data"
       }
     ],
     "menus": {
@@ -117,12 +120,12 @@
       ]
     },
     "configuration": {
-      "title": "Polaris",
+      "title": "Supernova AI",
       "properties": {
         "mentor.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Google Gemini API key for Polaris (e.g. from Google AI Studio)."
+          "description": "Google Gemini API key for Supernova AI (e.g. from Google AI Studio)."
         },
         "mentor.model": {
           "type": "string",

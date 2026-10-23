@@ -23,4 +23,7 @@ Thumbs.db
 .env
 .env.*
 *.env
-*.log
+
+SUPERNOVA_AI_IMPROVEMENT_PLAN.md
+PROJECT_OVERVIEW.md
+AI_MENTOR_REDESIGN_PLAN.md
