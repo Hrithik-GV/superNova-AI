@@ -41,7 +41,7 @@ export interface QuizConceptScore {
 export interface QuizResult {
   ts: string;
   sessionId: string;
-  total: 3;
+  total: number;
   correct: number;
   byConcept: Record<string, QuizConceptScore>;
 }
@@ -297,7 +297,7 @@ export function getQuizResults(globalState?: vscode.Memento): QuizResult[] {
         validResults.push({
           ts: item.ts,
           sessionId: item.sessionId,
-          total: (item.total === 3 ? 3 : item.total) as 3,
+          total: item.total || 4,
           correct: item.correct,
           byConcept: validByConcept
         });

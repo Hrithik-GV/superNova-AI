@@ -1,0 +1,115 @@
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="256" height="256">
+  <title>Supernova AI Cat</title>
+
+  <style>
+    .body {
+      animation: float 2.8s ease-in-out infinite;
+      transform-origin: 80px 85px;
+    }
+    .tail {
+      transform-origin: 112px 105px;
+      animation: wag 1.8s ease-in-out infinite;
+    }
+    .eyes {
+      animation: blink 4.5s infinite;
+      transform-origin: center;
+    }
+    .sparkle {
+      animation: twinkle 2s ease-in-out infinite;
+    }
+    @keyframes float {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-3px); }
+    }
+    @keyframes wag {
+      0%, 100% { transform: rotate(-4deg); }
+      50% { transform: rotate(7deg); }
+    }
+    @keyframes blink {
+      0%, 91%, 100% { transform: scaleY(1); }
+      94%, 97% { transform: scaleY(.08); }
+    }
+    @keyframes twinkle {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: .45; transform: scale(.85); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .body, .tail, .eyes, .sparkle { animation: none; }
+    }
+  </style>
+
+  <!-- Sparkles -->
+  <g class="sparkle" fill="#A78BFA">
+    <path d="M24 32 L28 42 L38 46 L28 50 L24 60 L20 50 L10 46 L20 42 Z"/>
+    <path d="M132 52 L135 59 L142 62 L135 65 L132 72 L129 65 L122 62 L129 59 Z" fill="#818CF8"/>
+  </g>
+
+  <!-- Shadow -->
+  <ellipse cx="80" cy="144" rx="37" ry="5" fill="#312E81" opacity=".22"/>
+
+  <!-- Tail -->
+  <g class="tail">
+    <path d="M103 111 C125 116 137 103 132 89 C129 80 120 83 121 91"
+          fill="none" stroke="#A5B4FC" stroke-width="13" stroke-linecap="round"/>
+    <path d="M103 111 C125 116 137 103 132 89"
+          fill="none" stroke="#818CF8" stroke-width="2" stroke-linecap="round" opacity=".7"/>
+  </g>
+
+  <g class="body">
+    <!-- Ears -->
+    <path d="M39 62 L34 22 Q33 15 41 21 L66 40 Z" fill="#E0E7FF"/>
+    <path d="M121 62 L126 22 Q127 15 119 21 L94 40 Z" fill="#E0E7FF"/>
+    <path d="M43 47 L41 29 L58 43 Z" fill="#F9A8D4"/>
+    <path d="M117 47 L119 29 L102 43 Z" fill="#F9A8D4"/>
+
+    <!-- Head -->
+    <path d="M33 65 C33 43 52 34 80 34 C108 34 127 43 127 65
+             L127 88 C127 112 107 126 80 126 C53 126 33 112 33 88 Z"
+          fill="#F8FAFC" stroke="#C7D2FE" stroke-width="2"/>
+
+    <!-- Side fur -->
+    <path d="M35 79 Q24 83 35 94 L41 91 Z" fill="#E0E7FF"/>
+    <path d="M125 79 Q136 83 125 94 L119 91 Z" fill="#E0E7FF"/>
+
+    <!-- Eyes -->
+    <g class="eyes">
+      <ellipse cx="61" cy="76" rx="8" ry="11" fill="#3730A3"/>
+      <ellipse cx="99" cy="76" rx="8" ry="11" fill="#3730A3"/>
+      <ellipse cx="63" cy="74" rx="3" ry="4" fill="#FFFFFF"/>
+      <ellipse cx="101" cy="74" rx="3" ry="4" fill="#FFFFFF"/>
+      <circle cx="57" cy="81" r="1.7" fill="#A5B4FC"/>
+      <circle cx="95" cy="81" r="1.7" fill="#A5B4FC"/>
+    </g>
+
+    <!-- Blush -->
+    <ellipse cx="48" cy="91" rx="8" ry="4" fill="#FDA4AF" opacity=".65"/>
+    <ellipse cx="112" cy="91" rx="8" ry="4" fill="#FDA4AF" opacity=".65"/>
+
+    <!-- Nose and smile -->
+    <path d="M76 89 Q80 86 84 89 L80 94 Z" fill="#F472B6"/>
+    <path d="M80 94 Q76 101 71 96 M80 94 Q84 101 89 96"
+          fill="none" stroke="#64748B" stroke-width="1.8" stroke-linecap="round"/>
+
+    <!-- Hoodie -->
+    <path d="M44 111 Q48 105 59 103 L66 100 L94 100 L101 103
+             Q112 105 116 111 L127 135 Q105 143 80 143
+             Q55 143 33 135 Z"
+          fill="#6366F1"/>
+    <path d="M60 104 Q80 118 100 104 L94 100 L66 100 Z"
+          fill="#818CF8"/>
+    <path d="M64 111 L69 115 M96 111 L91 115"
+          stroke="#C4B5FD" stroke-width="2" stroke-linecap="round"/>
+
+    <!-- Star emblem -->
+    <path d="M80 117 L83 124 L91 125 L85 130 L87 137
+             L80 133 L73 137 L75 130 L69 125 L77 124 Z"
+          fill="#FEF3C7"/>
+
+    <!-- Paws -->
+    <ellipse cx="52" cy="135" rx="15" ry="8" fill="#F8FAFC"/>
+    <ellipse cx="108" cy="135" rx="15" ry="8" fill="#F8FAFC"/>
+    <path d="M47 136 L47 139 M53 136 L53 139 M103 136 L103 139 M109 136 L109 139"
+          stroke="#C7D2FE" stroke-width="1.5" stroke-linecap="round"/>
+  </g>
+</svg>
